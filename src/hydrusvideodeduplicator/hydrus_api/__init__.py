@@ -891,7 +891,7 @@ class Client:
             payload["file_ids"] = file_ids
         return self._api_request("POST", self._SET_TIME_PATH, json=payload).json()
 
-    def new_session_client(self) -> Client:
+    def new_session_client(self) -> "Client":
         """Create a separate API session for background file prefetch."""
         return Client(access_key=self.access_key, api_url=self.api_url, verify_cert=self._verify_cert)
 
