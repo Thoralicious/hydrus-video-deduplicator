@@ -7,6 +7,7 @@ import json
 import mmap
 import os
 import signal
+import sys
 from pathlib import Path
 import struct
 import time
@@ -154,12 +155,23 @@ def monitor(pid, status_path, output_path, interval, terminal=True):
         Path(str(output_path)+'.summary.json').write_text(json.dumps(summary,indent=2)+'\n',encoding='utf-8')
 
 
-if __name__ == '__main__':
+def main(argv=None):
     signal.signal(signal.SIGINT,signal.SIG_IGN)
     parser = argparse.ArgumentParser()
     parser.add_argument('--pid',type=int,required=True)
     parser.add_argument('--status',required=True)
     parser.add_argument('--output',required=True)
     parser.add_argument('--interval',type=float,default=2)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     monitor(args.pid,args.status,args.output,max(.5,args.interval))
+
+
+def run_if_requested():
+    if len(sys.argv) > 1 and sys.argv[1] == '--hvd-internal-diagnostic-watchdog':
+        main(sys.argv[2:])
+        return True
+    return False
+
+
+if __name__ == '__main__':
+    main()

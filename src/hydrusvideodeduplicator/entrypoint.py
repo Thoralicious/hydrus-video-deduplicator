@@ -117,10 +117,10 @@ def main(
     dedup_database_dir: Annotated[
         Optional[Path], typer.Option(help="The directory to store the database used for dedupe.")
     ] = config.dedupe_database_dir,
-    diagnostic_mode: Annotated[bool, typer.Option("--diagnostic-mode", help="Record program stages and resource usage.")] = False,
+    diagnostic_mode: Annotated[bool, typer.Option("--diagnostic-mode", is_flag=True, help="Record program stages and resource usage.")] = False,
     diagnostics_interval: Annotated[float, typer.Option(help="Seconds between resource samples.")] = 2.0,
     log_path: Annotated[Optional[Path], typer.Option(help="Directory for diagnostic and test-run JSON files.")] = None,
-    no_submit: Annotated[bool, typer.Option("--no-submit", help="Do not send duplicate relationships to Hydrus.")] = False,
+    no_submit: Annotated[bool, typer.Option("--no-submit", is_flag=True, help="Do not send duplicate relationships to Hydrus.")] = False,
     test_run: Annotated[Optional[TestRunMode], typer.Option(help="Test mode: new, temp, or save.")] = None,
     verbose: Annotated[Optional[bool], typer.Option(help="Verbose logging")] = False,
     debug: Annotated[Optional[bool], typer.Option(hidden=True)] = False,

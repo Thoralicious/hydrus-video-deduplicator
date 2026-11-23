@@ -58,15 +58,24 @@ class SearchDiagnostics:
                   max_events=max_events, max_detailed_comparisons=max_detailed_comparisons)
         if watchdog:
             try:
-                if getattr(sys, 'frozen', False):
-                    raise OSError('External watchdog needs the Python entrypoint in this build')
                 self.status_file = self.status_path.open('x+b')
                 self.status_file.truncate(STATUS_SIZE)
                 self.shared = mmap.mmap(self.status_file.fileno(),STATUS_SIZE)
                 self._publish(force=True)
-                self.worker = subprocess.Popen([sys.executable,'-m','hydrusvideodeduplicator.diagnostic_watchdog',
-                    '--pid',str(os.getpid()),'--status',str(self.status_path),'--output',str(self.resource_path),
-                    '--interval',str(self.interval)],stdin=subprocess.DEVNULL)
+                if getattr(sys, 'frozen', False):
+                    command = [sys.executable, '--hvd-internal-diagnostic-watchdog']
+                else:
+                    command = [sys.executable, '-m', 'hydrusvideodeduplicator.diagnostic_watchdog']
+                command.extend(['--pid', str(os.getpid()), '--status', str(self.status_path),
+                                '--output', str(self.resource_path), '--interval', str(self.interval)])
+                process_options = {
+                    'stdin': subprocess.DEVNULL,
+                    'stdout': subprocess.DEVNULL,
+                    'stderr': subprocess.DEVNULL,
+                }
+                if os.name == 'nt':
+                    process_options['creationflags'] = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+                self.worker = subprocess.Popen(command, **process_options)
             except OSError as error:
                 self.emit('monitor_unavailable', error_type=type(error).__name__, reason='frozen_executable' if getattr(sys,'frozen',False) else 'watchdog_start_failed')
         tqdm.write("Diagnostic logs: " + ", ".join(f"{phase}={path}" for phase, path in self.paths.items()))
