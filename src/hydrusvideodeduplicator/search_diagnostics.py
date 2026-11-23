@@ -28,7 +28,7 @@ class SearchDiagnostics:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         run_id = f"{stamp}-{uuid4().hex[:8]}"
         self.paths = {phase: directory / f"{phase}-diagnostics-{run_id}.jsonl"
-                      for phase in ("run", "hash", "tree", "search")}
+                      for phase in ("run", "hash", "efi", "search")}
         self.streams = {phase: path.open("x", encoding="utf-8") for phase, path in self.paths.items()}
         self.path = self.paths["run"]
         self.started = time.perf_counter()
@@ -84,14 +84,20 @@ class SearchDiagnostics:
         operation = fields.get("operation")
         if event in ("session_start", "session_end", "monitor_unavailable"):
             return "run"
+        if event == "frame_index_built":
+            return "efi"
+        if event.startswith("frame_index_query_"):
+            return "search"
         if operation is not None:
             if operation in {"hydrus_file_selection", "hashing_and_queueing", "video_fetch_and_hash",
                              "video_download", "decode_and_perceptual_hash", "database_hash_queue_write"}:
                 return "hash"
-            if operation in {"search_tree_insertion", "tree_node_fetch", "tree_maintenance"}:
-                return "tree"
+            if operation in {"search_tree_insertion", "tree_node_fetch", "tree_maintenance",
+                             "hash_cache_fingerprint", "frame_index_add", "frame_index_seal"}:
+                return "efi"
             if operation in {"duplicate_search", "video_search_and_reporting", "native_comparison",
-                             "hydrus_relationship_submission"}:
+                             "hydrus_relationship_submission", "frame_index_query", "exact_submission_commit",
+                             "exact_query_commit", "hydrus_report"}:
                 return "search"
         if self.operations:
             return self.operations[-1]["phase"]

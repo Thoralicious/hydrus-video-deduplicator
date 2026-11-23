@@ -25,8 +25,15 @@ from hydrusvideodeduplicator.client import (
 )
 from hydrusvideodeduplicator.config import Config
 from hydrusvideodeduplicator.db import DedupeDB
+from hydrusvideodeduplicator.db_lock import DatabaseBusyError
 from hydrusvideodeduplicator.dedup import HydrusVideoDeduplicator
 from hydrusvideodeduplicator.dedup_util import print_and_log
+from hydrusvideodeduplicator.frame_index_search import (
+    FrameIndexError,
+    similarity_cutoff,
+    validate_frame_index_workers,
+)
+from hydrusvideodeduplicator.frame_index_state import reset_frame_search_state, state_path_for
 from hydrusvideodeduplicator.search_diagnostics import SearchDiagnostics
 from dotenv import find_dotenv, load_dotenv
 
@@ -53,6 +60,11 @@ class TestRunMode(str, Enum):
     SAVE = "save"
 
 
+class SkipStage(str, Enum):
+    HASH = "hash"
+    SEARCH = "search"
+
+
 def prepare_test_database(directory: Path, mode: TestRunMode) -> Path:
     if mode is TestRunMode.SAVE:
         DedupeDB.set_db_name("videohashes.sqlite")
@@ -64,7 +76,9 @@ def prepare_test_database(directory: Path, mode: TestRunMode) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     if mode is TestRunMode.TEMP and not source.is_file():
         raise typer.BadParameter("--test-run temp requires an existing videohashes.sqlite database.")
-    for path in (target, Path(str(target) + "-wal"), Path(str(target) + "-shm"), temporary):
+    state = state_path_for(target)
+    for path in (target, Path(str(target) + "-wal"), Path(str(target) + "-shm"), temporary,
+                 state, Path(str(state) + "-wal"), Path(str(state) + "-shm")):
         path.unlink(missing_ok=True)
 
     if mode is TestRunMode.TEMP:
@@ -73,6 +87,13 @@ def prepare_test_database(directory: Path, mode: TestRunMode) -> Path:
                 source_db.backup(target_db)
                 target_db.commit()
         temporary.replace(target)
+        source_state = state_path_for(source)
+        if source_state.is_file():
+            target_state = state_path_for(target)
+            with closing(sqlite3.connect(source_state.as_uri() + "?mode=ro", uri=True)) as source_db:
+                with closing(sqlite3.connect(target_state)) as target_db:
+                    source_db.backup(target_db)
+                    target_db.commit()
 
     DedupeDB.set_db_name("test-videohashes.sqlite")
     return target
@@ -89,9 +110,10 @@ def main(
     threshold: Annotated[
         Optional[float], typer.Option(help="Similarity threshold for a pair of videos where 100 is identical")
     ] = config.similarity_threshold,
-    skip_hashing: Annotated[
-        Optional[bool], typer.Option(help="Skip perceptual hashing and just search for duplicates")
-    ] = False,
+    skip: Annotated[
+        Optional[SkipStage],
+        typer.Option(help="Skip a stage: hash, or search (including EFI index construction)."),
+    ] = None,
     file_service_key: Annotated[
         Optional[List[str]], typer.Option(help="Local file service key")
     ] = config.hydrus_local_file_service_keys,
@@ -120,8 +142,13 @@ def main(
     diagnostic_mode: Annotated[bool, typer.Option("--diagnostic-mode", is_flag=True, help="Record program stages and resource usage.")] = False,
     diagnostics_interval: Annotated[float, typer.Option(help="Seconds between resource samples.")] = 2.0,
     log_path: Annotated[Optional[Path], typer.Option(help="Directory for diagnostic and test-run JSON files.")] = None,
-    no_submit: Annotated[bool, typer.Option("--no-submit", is_flag=True, help="Do not send duplicate relationships to Hydrus.")] = False,
-    test_run: Annotated[Optional[TestRunMode], typer.Option(help="Test mode: new, temp, or save.")] = None,
+    submit_results: Annotated[
+        Optional[str],
+        typer.Option(help="Submit duplicate relationships to Hydrus: true or false. Defaults to true normally and false in test runs."),
+    ] = None,
+    test_run: Annotated[Optional[TestRunMode], typer.Option(help="Test mode: new, temp, or save. Duplicate submissions are disabled by default.")] = None,
+    use_vptree: Annotated[bool, typer.Option("--use-vptree", help="Use the legacy VP-tree search instead of the EFI default.")] = False,
+    frame_index_workers: Annotated[int, typer.Option(help="EFI worker count; negative values mean all but N logical CPUs.")] = -2,
     verbose: Annotated[Optional[bool], typer.Option(help="Verbose logging")] = False,
     debug: Annotated[Optional[bool], typer.Option(hidden=True)] = False,
     gui: Annotated[  # This gui arg is unused, it's only here to show on --help. See run_main() for more info.
@@ -129,7 +156,32 @@ def main(
     ] = config.hvd_gui,
 ):
     # Fix mypy errors from optional parameters
-    assert threshold is not None and skip_hashing is not None and job_count is not None
+    assert threshold is not None and job_count is not None
+
+    if submit_results is None:
+        submission_enabled = test_run is None
+    elif submit_results.strip().lower() in {"true", "false"}:
+        submission_enabled = submit_results.strip().lower() == "true"
+    else:
+        raise typer.BadParameter("--submit-results must be either true or false.")
+    if skip is SkipStage.SEARCH:
+        print("Duplicate search is skipped; duplicate results will NOT be submitted to Hydrus.")
+    else:
+        print(
+            "Duplicate results will be submitted to Hydrus."
+            if submission_enabled
+            else "Duplicate results will NOT be submitted to Hydrus."
+        )
+
+    if not use_vptree:
+        try:
+            validate_frame_index_workers(frame_index_workers)
+        except FrameIndexError as error:
+            raise typer.BadParameter(str(error), param_hint="--frame-index-workers") from error
+        try:
+            similarity_cutoff(threshold)
+        except FrameIndexError as error:
+            raise typer.BadParameter(str(error), param_hint="--threshold") from error
 
     # CLI debug parameter sets log level to info or debug
     loglevel = logging.INFO
@@ -184,8 +236,9 @@ def main(
         print_and_log(logger, "Hydrus API URL is not set. Please set with '--api-url'.")
         exit_from_failure()
 
-    if threshold < 0.0 or threshold > 100.0:
-        print_and_log(logger, f"Invalid similarity threshold: {threshold}. Must be between 0 and 100.", logging.ERROR)
+    minimum_threshold = 0.0 if use_vptree else 1.0
+    if threshold < minimum_threshold or threshold > 100.0:
+        print_and_log(logger, f"Invalid similarity threshold: {threshold}. Must be between {minimum_threshold:g} and 100.", logging.ERROR)
         exit_from_failure()
 
     # Client connection
@@ -248,17 +301,17 @@ def main(
             f"Database filesize: {db_stats.file_size} bytes.",
         )
 
-        if clear_search_tree:
+        if clear_search_tree or clear_search_cache:
             db.begin_transaction()
             with db.conn:
-                db.clear_search_tree()
-            print("[green] Cleared the search tree.")
-
-        if clear_search_cache:
-            db.begin_transaction()
-            with db.conn:
-                db.clear_search_cache()
-            print("[green] Cleared the search cache.")
+                if use_vptree:
+                    if clear_search_tree:
+                        db.clear_search_tree()
+                    if clear_search_cache:
+                        db.clear_search_cache()
+                else:
+                    reset_frame_search_state(state_path_for(DedupeDB.get_db_file_path()))
+            print("[green] Cleared the selected search progress.")
 
     else:
         print_and_log(logger, f"Database not found. Creating one at '{DedupeDB.get_db_file_path()}'", logging.INFO)
@@ -282,7 +335,11 @@ def main(
         custom_query=query,
     )
     deduper.diagnostics = diagnostics
-    deduper.no_submit = no_submit
+    deduper.submit_results = submission_enabled
+    deduper.frame_index = not use_vptree
+    deduper.frame_index_workers = frame_index_workers
+    deduper.frame_index_persist_progress = test_run is not None
+    deduper.log_directory = log_directory
 
     if debug:
         deduper.hydlog.setLevel(logging.DEBUG)
@@ -290,7 +347,19 @@ def main(
 
     try:
         with diagnostics.operation("deduplication") if diagnostics else nullcontext():
-            num_similar_pairs = deduper.deduplicate(skip_hashing=skip_hashing)
+            try:
+                num_similar_pairs = deduper.deduplicate(
+                    skip_hashing=skip is SkipStage.HASH,
+                    skip_search=skip is SkipStage.SEARCH,
+                )
+            except FrameIndexError as error:
+                print(f"EFI search stopped: {error}")
+                raise typer.Exit(code=1) from None
+            except DatabaseBusyError as error:
+                print(f"Database operation stopped: {error}")
+                raise typer.Exit(code=1) from None
+    finally:
+        try:
             if test_run_report_path is not None:
                 log_directory.mkdir(parents=True, exist_ok=True)
                 report_path = log_directory / "pairs.json"
@@ -299,11 +368,10 @@ def main(
                     rows.append({"file_a": file_a, "file_b": file_b,
                                  "score_a_to_b": score_a_to_b, "score_b_to_a": score_b_to_a})
                 report_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
-    finally:
-        if diagnostics is not None:
-            diagnostics.close()
-
-    db.close()
+        finally:
+            if diagnostics is not None:
+                diagnostics.close()
+            db.close()
 
     return num_similar_pairs
 

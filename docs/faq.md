@@ -45,13 +45,13 @@ See [Where are the video hashes stored?](#where-are-the-video-hashes-stored) loc
 
     - Initial hashing generally takes longer than searching for duplicates. It will also probably get slower as it progresses, because they are hashed in order of increasing file size.
 
-1. Then, the perceptual hashes are put into a data structure to make it fast to search for duplicates.
-
-    - Note: Initial search tree building may take a while, but it should be very fast on subsequent runs when new files are added.
+1. Then, EFI builds an exact frame-hash index in memory from the cached hashes. The index is rebuilt on each run; saved query and submission progress lets an interrupted search resume.
 
 1. Finally, it will search the database for potential duplicates and mark them as potential duplicates in Hydrus.
 
 You can run the program again when you add more files to find more duplicates.
+
+The legacy VP-tree search is available with `--use-vptree`.
 
 See the [Theory](theory.md) for an in-depth explanation for how it all works.
 
@@ -103,7 +103,7 @@ These are the same queries as would be used in Hydrus.
 
 ## I want to search for duplicates without hashing new video files
 
-You can either use `--skip-hashing`, press CTRL+C while perceptual hashing is running, or use a query limiting when files were imported.
+Use `--skip hash` to search the cached hashes without hashing new files, press CTRL+C while perceptual hashing is running, or use a query limiting when files were imported.
 
 <details>
 <summary>Example query that limits import time</summary>
