@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import atexit
+from contextlib import nullcontext
 from typing import TYPE_CHECKING, Annotated, List, Optional
 
 if TYPE_CHECKING:
@@ -22,6 +24,7 @@ from hydrusvideodeduplicator.config import Config
 from hydrusvideodeduplicator.db import DedupeDB
 from hydrusvideodeduplicator.dedup import HydrusVideoDeduplicator
 from hydrusvideodeduplicator.dedup_util import print_and_log
+from hydrusvideodeduplicator.search_diagnostics import SearchDiagnostics
 from dotenv import find_dotenv, load_dotenv
 
 import sys
@@ -80,6 +83,8 @@ def main(
     dedup_database_dir: Annotated[
         Optional[Path], typer.Option(help="The directory to store the database used for dedupe.")
     ] = config.dedupe_database_dir,
+    diagnostic_mode: Annotated[bool, typer.Option("--diagnostic-mode", help="Record program stages and resource usage.")] = False,
+    diagnostics_interval: Annotated[float, typer.Option(help="Seconds between resource samples.")] = 2.0,
     verbose: Annotated[Optional[bool], typer.Option(help="Verbose logging")] = False,
     debug: Annotated[Optional[bool], typer.Option(hidden=True)] = False,
     gui: Annotated[  # This gui arg is unused, it's only here to show on --help. See run_main() for more info.
@@ -109,6 +114,9 @@ def main(
         logging.disable()
 
     DedupeDB.set_db_dir(dedup_database_dir)
+    diagnostics = SearchDiagnostics(dedup_database_dir, interval=diagnostics_interval) if diagnostic_mode else None
+    if diagnostics is not None:
+        atexit.register(diagnostics.close)
 
     # Print a warning if the deprecated overwrite option is set
     if overwrite is not None:
@@ -138,17 +146,13 @@ def main(
     # Client connection
     print_and_log(logger, f"Connecting to Hydrus at {api_url}")
     try:
-        hvdclient = create_client(
-            file_service_key,
-            api_url,
-            api_key,
-            verify_cert,
-        )
-        api_version = hvdclient.get_api_version()
-        hydrus_api_version = hvdclient.get_hydrus_api_version()
-        print_and_log(logger, f"Dedupe API version: 'v{api_version}'")
-        print_and_log(logger, f"Hydrus API version: 'v{hydrus_api_version}'")
-        hvdclient.verify_permissions()
+        with diagnostics.operation("hydrus_connect_and_permissions") if diagnostics else nullcontext():
+            hvdclient = create_client(file_service_key, api_url, api_key, verify_cert)
+            api_version = hvdclient.get_api_version()
+            hydrus_api_version = hvdclient.get_hydrus_api_version()
+            print_and_log(logger, f"Dedupe API version: 'v{api_version}'")
+            print_and_log(logger, f"Hydrus API version: 'v{hydrus_api_version}'")
+            hvdclient.verify_permissions()
     except (FailedHVDClientConnection, ClientAPIException) as exc:
         print_and_log(logger, f"{exc.pretty_msg} \nException: {exc}", logging.FATAL)
         exit_from_failure()
@@ -161,12 +165,14 @@ def main(
     if DedupeDB.does_db_exist():
         print_and_log(logger, f"Found existing database at: '{DedupeDB.get_db_file_path()}'")
         db = DedupeDB.DedupeDb(DedupeDB.get_db_dir(), DedupeDB.get_db_name())
-        db.init_connection()
+        with diagnostics.operation("database_open") if diagnostics else nullcontext():
+            db.init_connection()
         # Upgrade the database before doing anything.
         db.begin_transaction()
         db_upgraded = False
         with db.conn:
-            db_upgraded = db.upgrade_db()
+            with diagnostics.operation("database_upgrade") if diagnostics else nullcontext():
+                db_upgraded = db.upgrade_db()
         # Vacuum DB after a successful database upgrade. This can reduce space by 1/2 in cases of large
         # db migrations.
         if db_upgraded:
@@ -179,7 +185,8 @@ def main(
                 logger,
                 f"Database filesize before vacuum: {db_stats.file_size} bytes.",
             )
-            db.vacuum()
+            with diagnostics.operation("database_vacuum") if diagnostics else nullcontext():
+                db.vacuum()
             db_stats = DedupeDB.get_db_stats(db)
             print_and_log(
                 logger,
@@ -213,10 +220,12 @@ def main(
         if not DedupeDB.get_db_dir().exists():
             DedupeDB.create_db_dir()
         db = DedupeDB.DedupeDb(DedupeDB.get_db_dir(), DedupeDB.get_db_name())
-        db.init_connection()
+        with diagnostics.operation("database_open") if diagnostics else nullcontext():
+            db.init_connection()
         db.begin_transaction()
         with db.conn:
-            db.create_tables()
+            with diagnostics.operation("database_create_schema") if diagnostics else nullcontext():
+                db.create_tables()
         db_stats = DedupeDB.get_db_stats(db)
 
     deduper = HydrusVideoDeduplicator(
@@ -227,14 +236,18 @@ def main(
         failed_page_name=failed_page_name,
         custom_query=query,
     )
+    deduper.diagnostics = diagnostics
 
     if debug:
         deduper.hydlog.setLevel(logging.DEBUG)
         deduper._DEBUG = True
 
-    num_similar_pairs = deduper.deduplicate(
-        skip_hashing=skip_hashing,
-    )
+    try:
+        with diagnostics.operation("deduplication") if diagnostics else nullcontext():
+            num_similar_pairs = deduper.deduplicate(skip_hashing=skip_hashing)
+    finally:
+        if diagnostics is not None:
+            diagnostics.close()
 
     db.close()
 

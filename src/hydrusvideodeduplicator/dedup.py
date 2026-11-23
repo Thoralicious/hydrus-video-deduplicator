@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -58,20 +59,23 @@ class FileHasher:
     A class to fetch a file from Hydrus and phash it.
     """
 
-    def __init__(self, client: HVDClient, num_threads: int = 0):
+    def __init__(self, client: HVDClient, num_threads: int = 0, diagnostics=None):
         self.client = client
         self.num_threads = num_threads
+        self.diagnostics = diagnostics
 
     def _fetch_file(self, file_hash: str):
         try:
-            response = self.client.client.get_file(hash_=file_hash)
+            with self.diagnostics.operation("video_download", file_hash=file_hash) if self.diagnostics else nullcontext():
+                response = self.client.client.get_file(hash_=file_hash)
         except hydrus_api.HydrusAPIException as exc:
             raise HydrusApiException(exc)
         return response.content
 
     def _phash_file(self, file: bytes) -> bytes:
         try:
-            phash = compute_phash(file, self.num_threads)
+            with self.diagnostics.operation("decode_and_perceptual_hash") if self.diagnostics else nullcontext():
+                phash = compute_phash(file, self.num_threads)
             phash_bytes: bytes = phash.bytes
         except Exception as exc:
             raise FailedPerceptualHashException(str(exc))
@@ -176,6 +180,7 @@ class HydrusVideoDeduplicator:
         should_skip_step_fn: Callable[[], bool] | None = None,
     ):
         self.db = db
+        self.diagnostics = None
         self.client = client
         self.similarity_threshold = similarity_threshold
         self.job_count = job_count
@@ -222,7 +227,8 @@ class HydrusVideoDeduplicator:
         if skip_hashing:
             print("[yellow]Skipping perceptual hashing")
         else:
-            video_hashes = list(self.client.get_video_hashes(self.search_tags))
+            with self.diagnostics.operation("hydrus_file_selection") if self.diagnostics else nullcontext():
+                video_hashes = list(self.client.get_video_hashes(self.search_tags))
             video_hashes = self.filter_unhashed(video_hashes)
             print(f"[blue]Found {len(video_hashes)} eligible files to perceptually hash.")
             print("\nTip: You can skip perceptual hashing at any time by pressing CTRL+C.\n")
@@ -231,6 +237,7 @@ class HydrusVideoDeduplicator:
             with self.db.conn:
                 stats = PerceptualHashingStats()
                 try:
+                with self.diagnostics.operation("hashing_and_queueing", total_files=len(video_hashes)) if self.diagnostics else nullcontext():
                     stats = self.add_perceptual_hashes_to_db(video_hashes)
                 except CancelledPerceptualHashException as exc:
                     # Interrupted, but on purpose.
@@ -267,6 +274,7 @@ class HydrusVideoDeduplicator:
         self.db.begin_transaction()
         with self.db.conn:
             try:
+            with self.diagnostics.operation("search_tree_insertion") if self.diagnostics else nullcontext():
                 self.process_phashed_file_queue()
             except KeyboardInterrupt:
                 print("[yellow]Building the search tree was interrupted! Progress was saved.")
@@ -333,15 +341,18 @@ class HydrusVideoDeduplicator:
                 unit="file",
                 colour="BLUE",
             ) as pbar:
-                filehasher = FileHasher(self.client, self.job_count)
+                filehasher = FileHasher(self.client, self.job_count, self.diagnostics)
                 successful_phashed_count = 0
                 for video_hash in video_hashes:
+                    if self.diagnostics:
+                        self.diagnostics.progress(files_hashed=pbar.n, total_files=pbar.total)
                     if self.update_progress_callback:
                         self.update_progress_callback(HashingProgress(complete=pbar.n + 1, total=pbar.total))
                     if self.should_skip_step_fn and self.should_skip_step_fn():
                         return stats
 
-                    result = filehasher.fetch_and_phash_file(video_hash)
+                    with self.diagnostics.operation("video_fetch_and_hash", file_hash=video_hash) if self.diagnostics else nullcontext():
+                        result = filehasher.fetch_and_phash_file(video_hash)
                     if isinstance(result, FailedPerceptuallyHashedFile):
                         # We only want to add the failure to the page if the file was the actual cause of failure.
                         if isinstance(result.exc, HydrusApiException):
@@ -356,7 +367,8 @@ class HydrusVideoDeduplicator:
                             if self.page_logger:
                                 self.page_logger.add_failed_video(result.file_hash)
                     else:
-                        self.db.add_to_phashed_files_queue(result.file_hash, result.perceptual_hash)
+                        with self.diagnostics.operation("database_hash_queue_write") if self.diagnostics else nullcontext():
+                            self.db.add_to_phashed_files_queue(result.file_hash, result.perceptual_hash)
                         stats.success_hash_count += 1
                         successful_phashed_count += 1
                         # Commit periodically to save progress in case something fails.
@@ -383,7 +395,8 @@ class HydrusVideoDeduplicator:
             "do_default_content_merge": True,
         }
 
-        self.client.client.set_file_relationships([new_relationship])
+        with self.diagnostics.operation("hydrus_relationship_submission") if self.diagnostics else nullcontext():
+            self.client.client.set_file_relationships([new_relationship])
 
     def process_phashed_file_queue(self):
         """
@@ -412,12 +425,16 @@ class HydrusVideoDeduplicator:
                     "DELETE FROM phashed_file_queue WHERE file_hash = :file_hash AND phash = :phash",
                     {"file_hash": file_hash, "phash": perceptual_hash},
                 )
+                if self.diagnostics:
+                    self.diagnostics.progress(tree_files_inserted=pbar.n + 1, total_files=pbar.total)
                 processed_count += 1
                 # Commit periodically to save progress in case something fails.
                 COMMIT_BATCH_SIZE = 64
                 if processed_count % COMMIT_BATCH_SIZE == 0:
                     self.db.commit()
                 pbar.update(1)
+                if self.diagnostics:
+                    self.diagnostics.progress(tree_files_inserted=pbar.n, total_files=pbar.total)
                 if self.update_progress_callback:
                     self.update_progress_callback(BuildingSearchTreeProgress(complete=pbar.n, total=pbar.total))
             if self.update_progress_callback:
@@ -463,7 +480,8 @@ class HydrusVideoDeduplicator:
                     break
 
                 hash_id = hash_id[0]
-                result = tree.search_file(hash_id, max_hamming_distance=search_threshold)
+                with self.diagnostics.operation("duplicate_search", hash_id=hash_id) if self.diagnostics else nullcontext():
+                    result = tree.search_file(hash_id, max_hamming_distance=search_threshold)
                 file_hash_a = self.db.get_file_hash(hash_id)
                 for similar_hash_id, distance in result:
                     file_hash_b = self.db.get_file_hash(similar_hash_id)
@@ -488,6 +506,8 @@ class HydrusVideoDeduplicator:
                     self.db.commit()
 
                 pbar.update(1)
+                if self.diagnostics:
+                    self.diagnostics.progress(videos_searched=pbar.n, total_videos=pbar.total)
                 if self.update_progress_callback:
                     self.update_progress_callback(SearchingForDuplicatesProgress(complete=pbar.n, total=pbar.total))
         return num_similar_pairs // 2
