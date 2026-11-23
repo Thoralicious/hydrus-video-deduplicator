@@ -7,6 +7,7 @@ nav:
   - Home: index.md
   - Installation: installation.md
   - Usage: usage.md
+  - Diagnostics: diagnostics.md
   - FAQ: faq.md
   - Theory: theory.md
   - Development: development.md
