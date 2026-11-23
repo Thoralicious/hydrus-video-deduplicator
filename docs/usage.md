@@ -1,93 +1,67 @@
 # Usage
 
-## Creating a Hydrus API Key
+## Create a Hydrus API key
 
-1. [Enable the Hydrus Client API service](https://hydrusnetwork.github.io/hydrus/client_api.html#enabling_the_api). Ensure `use https` is enabled for the client api service.
+1. In Hydrus, open **Manage Services → Client API** and enable the [Client API service](https://hydrusnetwork.github.io/hydrus/client_api.html#enabling_the_api).
+2. Create a client API key with **permits everything** enabled. Do not set blacklist or whitelist filters for the key.
+3. Copy the key when Hydrus displays it. It is a long hexadecimal string, and HVD needs this key to connect.
 
-    - If you need https instead of http, you must specify this in the Hydrus API URL.
-        - Ex. For the CLI, use `python -m hydrusvideodeduplicator --api-url=https://localhost:45869`
+## Connect HVD to Hydrus
 
-    - Enable `allow non-local connections` in `manage services->client api` if you are running under [Windows Subsystem for Linux](https://learn.microsoft.com/en-us/windows/wsl/), or the connection will fail.
+By default, HVD connects to `http://localhost:45869`. Set a different address with `--api-url`. If you use HTTPS, enable **use https** in the Hydrus Client API settings and use an `https://` URL in HVD. Certificate verification is disabled by default; for the CLI, pass `--verify-cert` with the certificate path to enable verification. In the GUI, set `REQUESTS_CA_BUNDLE` to the certificate path.
 
-    - ⚠️ For https, SSL cert is **not verified** by default unless you enter the cert's file path.
-      - Ex. For the CLI, use `--verify-cert`
-      - For the GUI, this is only supported through the `REQUESTS_CA_BUNDLE` environment variable.
+If HVD runs inside [WSL](https://learn.microsoft.com/en-us/windows/wsl/) and Hydrus runs on Windows, enable **allow non-local connections** in Hydrus' Client API settings and use the appropriate Windows host address.
 
-2. Create a client api service key with `permits everything` enabled.
+## Run HVD
 
-    - Do NOT set blacklist/whitelist filters for the API token.
-
-> **Example**: The API key should look something vaguely like `78d2fcc9fe1f43c5008959ed1abfe38ffedcfa127d4f051a1038e068d3e32656`
-
-> **Note**: You will need this API key in the next step, so you should probably copy this API key to your clipboard.
-
-After getting your API key, continue to [Running Video Dedupe](#running-video-dedupe).
-
-## Running Video Dedupe
-
-<details open>
-<summary>Windows</summary>
-<br>
-
-Run hydrusvideodeduplicator-windows-x86_64.exe and enter the Hydrus API key you created previously when prompted.
-
-</details>
-
-<br>
-
-<details>
-<summary>Linux and macos</summary>
-
-Run the program and enter the Hydrus API key you created previously.
-
-<br>
-
-Example:
+On Windows, launch `hydrusvideodeduplicator-windows-x86_64.exe`. On Linux or macOS, run:
 
 ```sh
-python -m hydrusvideodeduplicator --api-key="78d2fcc9fe1f43c5008959ed1abfe38ffedcfa127d4f051a1038e068d3e32656"
+python -m hydrusvideodeduplicator
 ```
 
-To run the gui, add `--gui` to the command above. Ensure you have the GUI dependencies installed.
+Enter the copied API key when prompted. You can also provide it with `--api-key`.
 
-</details>
+To launch the GUI, add `--gui` and install the GUI dependencies. See all command-line options with `--help`.
 
-<br>
+HVD saves hashing progress to its database and continues from that progress on later runs. You can interrupt processing with `Ctrl+C` and resume later. This is useful when the first hashing pass would take a long time.
 
-To cancel any stage of processing at any time, press CTRL+C.
+## Select videos with a Hydrus query
 
-You may want to cancel the first step, perceptually hashing, before it's finished in order to search for duplicates on that subset of videos that have been hashed. The next time you run the program it will continue where you left off. This may be useful for large databases that may take forever to perceptually hash.
-
-See the full list of options with `--help`.
-
-See the [FAQ](./faq.md) for more information.
-
-### Advanced Usage
-
-You can select certain files with queries just like Hydrus. e.g. `--query="character:batman"`
-
-Test runs do not submit duplicate relationships to Hydrus by default. They save discovered pairs as JSON under the log directory:
+Use `--query` to choose which videos HVD processes. The query uses Hydrus tag syntax. For example, to select videos tagged `character:batman`:
 
 ```sh
-python -m hydrusvideodeduplicator --test-run new
+python -m hydrusvideodeduplicator --query "character:batman"
 ```
 
-Use `--test-run temp` instead to start from a disposable copy of the existing database. Both modes save pair results as JSON under `<DEDUP_DATABASE_DIR>/logs`; `--log-path` changes the log destination. `--test-run save` uses the current database and preserves its progress. Add `--submit-results true` only when you intend test-run results to be sent to Hydrus. `--submit-results false` disables submissions during a normal run too. The program prints whether duplicate results will be submitted before processing starts.
-
-Use `--skip search` to hash the selected videos and exit before building the EFI index or searching. This is useful for preparing a pre-hashed database. Use `--skip hash` to search existing cached hashes without hashing new files.
-
-### File access and prefetch
-
-For a loopback Hydrus API, HVD prefers the local file path returned by Hydrus and falls back to downloading the file through the API if the path is unavailable. A local-path open is retried for up to two seconds by default before falling back. For a trusted network share, set `HVD_TRUSTED_UNC_SHARE` to its exact share root (for example, `\\server\share`); `HVD_NAS_GRACE_SECONDS` changes the retry period.
-
-HVD prefetches known-size inputs in one background worker while hashing the current file. The combined prefetched and active input-buffer budget defaults to 768 MiB. Set `HVD_INPUT_BUFFER_MIB` to change it, or to `0` to disable prefetch while keeping local-path access. Decoder and other process memory are additional to this input-buffer limit.
-
-<details>
-<summary>Example</summary>
-<br>
+You can combine the query with other options, such as an alternate API address:
 
 ```sh
-python -m hydrusvideodeduplicator --api-key="..." --query="character:batman"
+python -m hydrusvideodeduplicator --api-url "http://localhost:45869" --query "character:batman"
 ```
 
-</details>
+## Test runs and stage controls
+
+Normal runs submit duplicate relationships by default. Test runs default to **not** submitting them and save discovered pairs as JSON. Test-run reports and diagnostic logs default to `<DEDUP_DATABASE_DIR>/logs`; use `--log-path` to choose another output directory.
+
+| Option | Database behavior |
+| --- | --- |
+| `--test-run new` | Start with a fresh `test-videohashes.sqlite` database. |
+| `--test-run temp` | Replace `test-videohashes.sqlite` with a disposable copy of the existing `videohashes.sqlite`, then continue from its progress. |
+| `--test-run save` | Use `videohashes.sqlite` and preserve progress made during the run. |
+
+To allow a test run to submit duplicate relationships, explicitly add `--submit-results true`. Add `--submit-results false` to disable submissions during a normal run too. HVD prints whether results will be submitted before processing.
+
+Use `--skip search` to hash selected videos and stop before EFI index construction and duplicate search. Use `--skip hash` to search using hashes already stored in the database, without hashing new videos.
+
+Add `--diagnostic-mode` to write phase logs and resource samples. See the [diagnostics guide](./diagnostics.md) for details.
+
+## File access and prefetch
+
+When the Hydrus API address is a loopback address, HVD prefers the local file path returned by Hydrus. If the path is unavailable, it falls back to downloading the file through the API. HVD retries opening a local path for up to two seconds by default before falling back; set `HVD_NAS_GRACE_SECONDS` to change that delay.
+
+Network-share paths are used only when their exact share root is trusted. Set `HVD_TRUSTED_UNC_SHARE` to that root, for example `\\server\share`.
+
+HVD prefetches known-size inputs with one background worker while hashing the current video. The active and prefetched input buffers share a 768 MiB budget by default. Set `HVD_INPUT_BUFFER_MIB` to change the budget, or to `0` to disable prefetch while keeping local-path access. Video decoding and other process memory are outside this input-buffer limit.
+
+See the [FAQ](./faq.md) for more help.
