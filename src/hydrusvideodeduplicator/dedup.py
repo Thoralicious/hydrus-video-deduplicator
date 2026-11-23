@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import gc
+import hashlib
+import json
 import logging
 import time
 from contextlib import nullcontext
@@ -15,12 +18,12 @@ if TYPE_CHECKING:
 
     FileHash = str
 
-import gc
-
 import hydrusvideodeduplicator.hydrus_api as hydrus_api
 
 from .client import HVDClient
 from .db import DedupeDB, vptree
+from .db_lock import DatabaseBusyError, database_lock
+from .frame_index_search import FrameIndexError, run_frame_index_search, service_context
 from .hashing import compute_phash
 from .page_logger import HydrusPageLogger
 from hvdaccelerators import vpdq
@@ -181,8 +184,12 @@ class HydrusVideoDeduplicator:
     ):
         self.db = db
         self.diagnostics = None
-        self.no_submit = False
+        self.submit_results = True
         self.test_run_pairs = {}
+        self.frame_index = True
+        self.frame_index_workers = -2
+        self.frame_index_persist_progress = False
+        self.log_directory = self.db.db_dir / "logs"
         self.client = client
         self.similarity_threshold = similarity_threshold
         self.job_count = job_count
@@ -212,7 +219,16 @@ class HydrusVideoDeduplicator:
     def deduplicate(
         self,
         skip_hashing: bool,
+        skip_search: bool = False,
     ) -> int:
+        try:
+            with database_lock(self.db.db_dir / self.db.db_name):
+                return self._deduplicate(skip_hashing, skip_search)
+        except DatabaseBusyError:
+            print("[red]Another HVD operation is already using this database directory.")
+            raise
+
+    def _deduplicate(self, skip_hashing: bool, skip_search: bool) -> int:
         """
         Run all deduplicate functions.
 
@@ -271,26 +287,33 @@ class HydrusVideoDeduplicator:
                             )
                     print(f"[green]Added {stats.success_hash_count} new perceptual hashes to the database.")
 
-        # Insert the perceptual hashed files into the vptree.
-        print("\nTip: You can skip building the search tree at any time by pressing CTRL+C.\n")
-        self.db.begin_transaction()
-        with self.db.conn:
-            try:
-                with self.diagnostics.operation("search_tree_insertion") if self.diagnostics else nullcontext():
-                    self.process_phashed_file_queue()
-            except KeyboardInterrupt:
-                print("[yellow]Building the search tree was interrupted! Progress was saved.")
-            else:
-                print("[green]Finished fully building the search tree.")
+        if skip_search:
+            print("[yellow]Skipping search index construction and duplicate search.")
+            self.hydlog.info("Search skipped after perceptual hashing.")
+            if self.update_progress_callback:
+                self.update_progress_callback(DoneProgress(None))
+            return 0
 
-        self.db.begin_transaction()
-        with self.db.conn:
-            try:
-                self.run_maintenance()
-            except KeyboardInterrupt:
-                print("[yellow]Maintenance was interrupted!")
-            else:
-                print("[green]Finished maintenance.")
+        if not self.frame_index:
+            print("\nTip: You can skip building the search tree at any time by pressing CTRL+C.\n")
+            self.db.begin_transaction()
+            with self.db.conn:
+                try:
+                    with self.diagnostics.operation("search_tree_insertion") if self.diagnostics else nullcontext():
+                        self.process_phashed_file_queue()
+                except KeyboardInterrupt:
+                    print("[yellow]Building the search tree was interrupted! Progress was saved.")
+                else:
+                    print("[green]Finished fully building the search tree.")
+
+            self.db.begin_transaction()
+            with self.db.conn:
+                try:
+                    self.run_maintenance()
+                except KeyboardInterrupt:
+                    print("[yellow]Maintenance was interrupted!")
+                else:
+                    print("[green]Finished maintenance.")
 
         # Number of potential duplicates before adding more.
         # This is just to print info for the user.
@@ -390,7 +413,7 @@ class HydrusVideoDeduplicator:
 
     def mark_videos_as_duplicates(self, video1_hash: str, video2_hash: str):
         """Mark a pair of videos as duplicates in Hydrus."""
-        if self.no_submit:
+        if not self.submit_results:
             return
         new_relationship = {
             "hash_a": video1_hash,
@@ -463,6 +486,47 @@ class HydrusVideoDeduplicator:
 
         Returns the number of similar file pairs found.
         """
+        if self.frame_index:
+            print("Searching the complete exact frame index.")
+            context = None
+            if self.submit_results or self.frame_index_persist_progress:
+                try:
+                    identity = service_context(self.client.client, self.client.client.api_url)
+                    context = hashlib.sha256(json.dumps(identity, sort_keys=True).encode("utf-8")).hexdigest()
+                except Exception as error:
+                    raise FrameIndexError(f"Could not identify the Hydrus client ({type(error).__name__}).") from None
+
+            def record_pair(file_a: str, file_b: str, score: int):
+                pair = tuple(sorted((file_a, file_b)))
+                pair_scores = self.test_run_pairs.setdefault(pair, [None, None])
+                pair_scores[0 if file_a == pair[0] else 1] = float(score)
+
+            self.db.commit()
+            if self.diagnostics:
+                self.diagnostics.progress(efi_search_started=True)
+            result = run_frame_index_search(
+                self.db.db_dir / self.db.db_name,
+                self.mark_videos_as_duplicates,
+                context=context,
+                threshold=self.similarity_threshold,
+                diagnostics=self.diagnostics,
+                should_skip=self.should_skip_step_fn,
+                progress=lambda complete, total: self.update_progress_callback(
+                    SearchingForDuplicatesProgress(complete=complete, total=total)
+                ) if self.update_progress_callback else None,
+                workers=self.frame_index_workers,
+                output_directory=self.log_directory,
+                record_pair=record_pair,
+                submission_enabled=self.submit_results,
+                persist_progress=self.frame_index_persist_progress,
+                acquire_lock=False,
+            )
+            if not result["complete"]:
+                raise FrameIndexError(
+                    f"EFI search stopped ({result['status']}); see {result['report_directory']}"
+                )
+            return result["unique_pairs"]
+
         tree = vptree.VpTreeManager(self.db)
         search_threshold = vptree.fix_vpdq_similarity(self.similarity_threshold)
 

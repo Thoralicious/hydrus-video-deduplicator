@@ -66,6 +66,16 @@ See the [FAQ](./faq.md) for more information.
 
 You can select certain files with queries just like Hydrus. e.g. `--query="character:batman"`
 
+Test runs do not submit duplicate relationships to Hydrus by default. They save discovered pairs as JSON under the log directory:
+
+```sh
+python -m hydrusvideodeduplicator --test-run new
+```
+
+Use `--test-run temp` instead to start from a disposable copy of the existing database. Both modes save pair results as JSON under `<DEDUP_DATABASE_DIR>/logs`; `--log-path` changes the log destination. `--test-run save` uses the current database and preserves its progress. Add `--submit-results true` only when you intend test-run results to be sent to Hydrus. `--submit-results false` disables submissions during a normal run too. The program prints whether duplicate results will be submitted before processing starts.
+
+Use `--skip search` to hash the selected videos and exit before building the EFI index or searching. This is useful for preparing a pre-hashed database. Use `--skip hash` to search existing cached hashes without hashing new files.
+
 <details>
 <summary>Example</summary>
 <br>

@@ -30,7 +30,7 @@ dependencies = [
     "requests",
     # vpdqpy dependencies
     "av",
-    "hvdaccelerators>=0.4.0",
+    "hvdaccelerators @ git+https://github.com/Thoralicious/hvdaccelerators.git@c63451bf4334c6e2c2609c2ecd9841721f676f8f",
 ]
 
 [project.optional-dependencies]
