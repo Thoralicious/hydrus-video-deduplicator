@@ -305,6 +305,7 @@ class Client:
     _FILE_HASHES_PATH = "/get_files/file_hashes"
     _GET_FILE_METADATA_PATH = "/get_files/file_metadata"
     _GET_FILE_PATH = "/get_files/file"
+    _GET_FILE_PATH_PATH = "/get_files/file_path"
     _GET_THUMBNAIL_PATH = "/get_files/thumbnail"
     _GET_RENDER_PATH = "/get_files/render"
 
@@ -890,8 +891,27 @@ class Client:
             payload["file_ids"] = file_ids
         return self._api_request("POST", self._SET_TIME_PATH, json=payload).json()
 
+    def new_session_client(self) -> Client:
+        """Create a separate API session for background file prefetch."""
+        return Client(access_key=self.access_key, api_url=self.api_url, verify_cert=self._verify_cert)
+
+    def get_file_path(self, hash_: str) -> dict[str, T.Any]:
+        with self._api_request(
+            "GET",
+            self._GET_FILE_PATH_PATH,
+            params={"hash": hash_},
+            timeout=(2, 5),
+            allow_redirects=False,
+        ) as response:
+            return response.json()
+
     def get_file(
-        self, hash_: T.Optional[str] = None, file_id: T.Optional[int] = None, download: T.Optional[bool] = None
+        self,
+        hash_: T.Optional[str] = None,
+        file_id: T.Optional[int] = None,
+        download: T.Optional[bool] = None,
+        *,
+        timeout: T.Optional[tuple[float, float]] = None,
     ) -> requests.Response:
         if (hash_ is None and file_id is None) or (hash_ is not None and file_id is not None):
             raise ValueError("Exactly one of hash_, file_id is required")
@@ -904,7 +924,8 @@ class Client:
         if download is not None:
             params["download"] = json.dumps(download)
 
-        return self._api_request("GET", self._GET_FILE_PATH, params=params, stream=True)
+        request_options = {"timeout": timeout} if timeout is not None else {}
+        return self._api_request("GET", self._GET_FILE_PATH, params=params, stream=True, **request_options)
 
     def get_file_relationships(
         self,
