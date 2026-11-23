@@ -4,10 +4,19 @@ import gc
 import hashlib
 import json
 import logging
+import math
+import os
 import time
-from contextlib import nullcontext
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack, closing, nullcontext
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
+from urllib.parse import urlsplit
+
+from requests import RequestException
+from urllib3.exceptions import HTTPError
 
 from rich import print
 from tqdm import tqdm
@@ -62,20 +71,68 @@ class FileHasher:
     A class to fetch a file from Hydrus and phash it.
     """
 
-    def __init__(self, client: HVDClient, num_threads: int = 0, diagnostics=None):
+    def __init__(self, client: HVDClient, num_threads: int = 0, diagnostics=None, *, api=None):
         self.client = client
+        self.api = client.client if api is None else api
         self.num_threads = num_threads
         self.diagnostics = diagnostics
 
-    def _fetch_file(self, file_hash: str):
+    def _local_file_path(self, file_hash: str) -> Path | None:
+        api_url = getattr(self.api, "api_url", None)
+        try:
+            hostname = urlsplit(api_url).hostname if isinstance(api_url, str) else None
+        except ValueError:
+            hostname = None
+        if hostname not in {"localhost", "127.0.0.1", "::1"}:
+            return None
+
+        try:
+            with self.diagnostics.operation("local_path_lookup", file_hash=file_hash) if self.diagnostics else nullcontext():
+                result = self.api.get_file_path(hash_=file_hash)
+            path = Path(result["path"])
+        except (hydrus_api.HydrusAPIException, RequestException, AttributeError, KeyError, TypeError, ValueError):
+            return None
+        if not path.is_absolute():
+            return None
+        if path.drive.startswith("\\\\"):
+            trusted_share = os.environ.get("HVD_TRUSTED_UNC_SHARE", "").rstrip("\\/")
+            if not trusted_share or path.drive.casefold() != trusted_share.casefold():
+                return None
+
+        try:
+            grace_seconds = float(os.environ.get("HVD_NAS_GRACE_SECONDS", "2"))
+            if not math.isfinite(grace_seconds) or grace_seconds < 0:
+                raise ValueError
+        except ValueError:
+            grace_seconds = 2.0
+
+        deadline = time.monotonic() + grace_seconds
+        while True:
+            try:
+                with path.open("rb"):
+                    pass
+                return path
+            except OSError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                time.sleep(min(0.1, remaining))
+
+    def _fetch_file(self, file_hash: str, *, timeout=None) -> bytes:
         try:
             with self.diagnostics.operation("video_download", file_hash=file_hash) if self.diagnostics else nullcontext():
-                response = self.client.client.get_file(hash_=file_hash)
-        except hydrus_api.HydrusAPIException as exc:
-            raise HydrusApiException(exc)
-        return response.content
+                response = (self.api.get_file(hash_=file_hash) if timeout is None
+                            else self.api.get_file(hash_=file_hash, timeout=timeout))
+                with closing(response):
+                    content = response.content
+            if self.diagnostics:
+                self.diagnostics.progress(downloaded_bytes=len(content))
+                self.diagnostics.emit("video_download_complete", file_hash=file_hash, downloaded_bytes=len(content))
+        except (hydrus_api.HydrusAPIException, RequestException, HTTPError) as exc:
+            raise HydrusApiException(exc) from exc
+        return content
 
-    def _phash_file(self, file: bytes) -> bytes:
+    def _phash_file(self, file: bytes | Path) -> bytes:
         try:
             with self.diagnostics.operation("decode_and_perceptual_hash") if self.diagnostics else nullcontext():
                 phash = compute_phash(file, self.num_threads)
@@ -90,12 +147,63 @@ class FileHasher:
 
         return phash_bytes
 
+    def prepare_buffer(self, file_hash: str, size: int) -> tuple[bytes, bool] | None:
+        """Fetch a bounded input buffer, preferring the local Hydrus file path."""
+        if size <= 0:
+            return None
+        path = self._local_file_path(file_hash)
+        if path is not None:
+            try:
+                with path.open("rb") as source:
+                    if os.fstat(source.fileno()).st_size == size:
+                        content = source.read(size + 1)
+                        if len(content) == size:
+                            return content, True
+            except OSError:
+                pass
+        try:
+            with closing(self.api.get_file(hash_=file_hash, timeout=(3, 30))) as response:
+                content = response.raw.read(size + 1, decode_content=True)
+                if len(content) == size:
+                    return content, False
+        except (hydrus_api.HydrusAPIException, RequestException, HTTPError, OSError, TypeError):
+            pass
+        return None
+
+    def hash_buffer(self, file_hash: str, prepared: tuple[bytes, bool] | None):
+        if prepared is None:
+            return self.fetch_and_phash_file(file_hash)
+        content, local = prepared
+        try:
+            phash = self._phash_file(content)
+        except FailedPerceptualHashException as exc:
+            return FailedPerceptuallyHashedFile(file_hash, exc)
+        if self.diagnostics:
+            self.diagnostics.emit("video_buffer_used", file_hash=file_hash,
+                                  delivery="local_path" if local else "http")
+        return PerceptuallyHashedFile(file_hash, phash)
+
     def fetch_and_phash_file(self, file_hash: str) -> PerceptuallyHashedFile | FailedPerceptuallyHashedFile:
         """
         Retrieves the file from Hydrus and calculates its perceptual hash and returns the result.
 
         Returns FailedPerceptuallyHashedFile with the failed video hash if there are any errors.
         """
+        local_path = self._local_file_path(file_hash)
+        if local_path is not None:
+            try:
+                phash = self._phash_file(local_path)
+            except (OSError, FailedPerceptualHashException):
+                if self.diagnostics:
+                    self.diagnostics.emit("video_local_path_fallback", file_hash=file_hash)
+            else:
+                if self.diagnostics:
+                    self.diagnostics.emit("video_local_path_used", file_hash=file_hash)
+                return PerceptuallyHashedFile(file_hash, phash)
+
+        return self._fetch_and_phash_http(file_hash)
+
+    def _fetch_and_phash_http(self, file_hash: str):
         try:
             file = self._fetch_file(file_hash)
         except HydrusApiException as exc:
@@ -112,6 +220,82 @@ class FileHasher:
             return FailedPerceptuallyHashedFile(file_hash, exc)
 
         return PerceptuallyHashedFile(file_hash, phash)
+
+
+def input_buffer_budget() -> int:
+    try:
+        return max(0, int(os.environ.get("HVD_INPUT_BUFFER_MIB", "768"))) * 1024**2
+    except ValueError:
+        return 768 * 1024**2
+
+
+class VideoInputQueue:
+    """Keep the active input and lookahead buffers within one RAM budget."""
+
+    def __init__(self, worker, foreground: FileHasher, background: FileHasher,
+                 files: Sequence[str], budget: int):
+        self.worker = worker
+        self.foreground = foreground
+        self.background = background
+        self.files = files
+        self.budget = budget
+        self.pending = deque()
+        self.reserved = 0
+        self.active_size = 0
+        self.metadata_start = -1
+        self.sizes = {}
+
+    def metadata(self, index: int):
+        start = index // 128 * 128
+        if start != self.metadata_start:
+            self.metadata_start = start
+            try:
+                response = self.foreground.api.get_file_metadata(
+                    hashes=self.files[start:start + 128],
+                    create_new_file_ids=False,
+                    include_services_object=False,
+                )
+                self.sizes = {row["hash"]: row for row in response["metadata"]}
+            except (hydrus_api.HydrusAPIException, RequestException, KeyError, TypeError, ValueError):
+                self.sizes = {}
+        return self.sizes.get(self.files[index], {})
+
+    def take(self, index: int) -> tuple[bytes, bool] | None:
+        self.reserved -= self.active_size
+        self.active_size = 0
+        next_index = self.pending[-1][0] + 1 if self.pending else index
+        for position in range(next_index, len(self.files)):
+            size = self.metadata(position).get("size")
+            if not isinstance(size, int) or not 0 < size <= self.budget - self.reserved:
+                break
+            work = self.worker.submit(self.background.prepare_buffer, self.files[position], size)
+            self.pending.append((position, size, work))
+            self.reserved += size
+        if not self.pending:
+            return None
+        position, self.active_size, work = self.pending.popleft()
+        assert position == index
+        try:
+            prepared = work.result()
+        except Exception:
+            self.active_size = 0
+            self.discard()
+            return None
+        if prepared is None:
+            self.active_size = 0
+            self.discard()
+        return prepared
+
+    def discard(self) -> None:
+        for _, _, work in self.pending:
+            if not work.cancel():
+                try:
+                    work.result()
+                except Exception:
+                    pass
+        self.pending.clear()
+        self.active_size = 0
+        self.reserved = 0
 
 
 @dataclass
@@ -365,10 +549,25 @@ class HydrusVideoDeduplicator:
                 dynamic_ncols=True,
                 unit="file",
                 colour="BLUE",
-            ) as pbar:
+            ) as pbar, ExitStack() as input_stack:
                 filehasher = FileHasher(self.client, self.job_count, self.diagnostics)
+                input_queue = None
+                new_session_client = getattr(self.client.client, "new_session_client", None)
+                if video_hashes and (budget := input_buffer_budget()) and callable(new_session_client):
+                    background_api = new_session_client()
+                    input_stack.callback(background_api.session.close)
+                    worker = ThreadPoolExecutor(max_workers=1)
+                    input_stack.callback(lambda: worker.shutdown(wait=True, cancel_futures=True))
+                    input_queue = VideoInputQueue(
+                        worker,
+                        filehasher,
+                        FileHasher(self.client, self.job_count, self.diagnostics, api=background_api),
+                        video_hashes,
+                        budget,
+                    )
+                    input_stack.callback(input_queue.discard)
                 successful_phashed_count = 0
-                for video_hash in video_hashes:
+                for index, video_hash in enumerate(video_hashes):
                     if self.diagnostics:
                         self.diagnostics.progress(files_hashed=pbar.n, total_files=pbar.total)
                     if self.update_progress_callback:
@@ -376,8 +575,14 @@ class HydrusVideoDeduplicator:
                     if self.should_skip_step_fn and self.should_skip_step_fn():
                         return stats
 
+                    prepared = input_queue.take(index) if input_queue is not None else None
+                    local_buffer = prepared is not None and prepared[1]
                     with self.diagnostics.operation("video_fetch_and_hash", file_hash=video_hash) if self.diagnostics else nullcontext():
-                        result = filehasher.fetch_and_phash_file(video_hash)
+                        result = filehasher.hash_buffer(video_hash, prepared)
+                    del prepared
+                    if local_buffer and isinstance(result, FailedPerceptuallyHashedFile):
+                        input_queue.discard()
+                        result = filehasher._fetch_and_phash_http(video_hash)
                     if isinstance(result, FailedPerceptuallyHashedFile):
                         # We only want to add the failure to the page if the file was the actual cause of failure.
                         if isinstance(result.exc, HydrusApiException):

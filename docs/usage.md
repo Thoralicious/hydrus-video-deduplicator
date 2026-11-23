@@ -76,6 +76,12 @@ Use `--test-run temp` instead to start from a disposable copy of the existing da
 
 Use `--skip search` to hash the selected videos and exit before building the EFI index or searching. This is useful for preparing a pre-hashed database. Use `--skip hash` to search existing cached hashes without hashing new files.
 
+### File access and prefetch
+
+For a loopback Hydrus API, HVD prefers the local file path returned by Hydrus and falls back to downloading the file through the API if the path is unavailable. A local-path open is retried for up to two seconds by default before falling back. For a trusted network share, set `HVD_TRUSTED_UNC_SHARE` to its exact share root (for example, `\\server\share`); `HVD_NAS_GRACE_SECONDS` changes the retry period.
+
+HVD prefetches known-size inputs in one background worker while hashing the current file. The combined prefetched and active input-buffer budget defaults to 768 MiB. Set `HVD_INPUT_BUFFER_MIB` to change it, or to `0` to disable prefetch while keeping local-path access. Decoder and other process memory are additional to this input-buffer limit.
+
 <details>
 <summary>Example</summary>
 <br>
