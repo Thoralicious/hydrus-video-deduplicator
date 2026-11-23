@@ -181,6 +181,8 @@ class HydrusVideoDeduplicator:
     ):
         self.db = db
         self.diagnostics = None
+        self.no_submit = False
+        self.test_run_pairs = {}
         self.client = client
         self.similarity_threshold = similarity_threshold
         self.job_count = job_count
@@ -237,8 +239,8 @@ class HydrusVideoDeduplicator:
             with self.db.conn:
                 stats = PerceptualHashingStats()
                 try:
-                with self.diagnostics.operation("hashing_and_queueing", total_files=len(video_hashes)) if self.diagnostics else nullcontext():
-                    stats = self.add_perceptual_hashes_to_db(video_hashes)
+                    with self.diagnostics.operation("hashing_and_queueing", total_files=len(video_hashes)) if self.diagnostics else nullcontext():
+                        stats = self.add_perceptual_hashes_to_db(video_hashes)
                 except CancelledPerceptualHashException as exc:
                     # Interrupted, but on purpose.
                     stats = exc.stats
@@ -274,8 +276,8 @@ class HydrusVideoDeduplicator:
         self.db.begin_transaction()
         with self.db.conn:
             try:
-            with self.diagnostics.operation("search_tree_insertion") if self.diagnostics else nullcontext():
-                self.process_phashed_file_queue()
+                with self.diagnostics.operation("search_tree_insertion") if self.diagnostics else nullcontext():
+                    self.process_phashed_file_queue()
             except KeyboardInterrupt:
                 print("[yellow]Building the search tree was interrupted! Progress was saved.")
             else:
@@ -388,6 +390,8 @@ class HydrusVideoDeduplicator:
 
     def mark_videos_as_duplicates(self, video1_hash: str, video2_hash: str):
         """Mark a pair of videos as duplicates in Hydrus."""
+        if self.no_submit:
+            return
         new_relationship = {
             "hash_a": video1_hash,
             "hash_b": video2_hash,
@@ -486,6 +490,10 @@ class HydrusVideoDeduplicator:
                 for similar_hash_id, distance in result:
                     file_hash_b = self.db.get_file_hash(similar_hash_id)
                     if hash_id != similar_hash_id:
+                        score = max(0.0, min(100.0, 101.0 - distance))
+                        pair = tuple(sorted((file_hash_a, file_hash_b)))
+                        pair_scores = self.test_run_pairs.setdefault(pair, [None, None])
+                        pair_scores[0 if file_hash_a == pair[0] else 1] = score
                         self.hydlog.info(f'Similar files found: "{file_hash_a}" and "{file_hash_b}"')
                         self.mark_videos_as_duplicates(file_hash_a, file_hash_b)
                         num_similar_pairs += 1

@@ -80,6 +80,12 @@ def set_db_dir(dir: Path):
     _db_dir = dir
 
 
+def set_db_name(name: str):
+    """Set the active database filename."""
+    global _DB_FILE_NAME
+    _DB_FILE_NAME = name
+
+
 def get_db_dir():
     """Get the directory of the database."""
     return _db_dir

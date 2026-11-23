@@ -119,7 +119,8 @@ def monitor(pid, status_path, output_path, interval, terminal=True):
                     samples += 1
                     age = max(0,now-status.get('last_progress_at',now))
                     record = {'event':'resource_sample','timestamp_utc':datetime.now(timezone.utc).isoformat(),
-                              'monotonic_seconds':now,'pid':pid,'stage':status.get('stage','starting'),
+                              'monotonic_seconds':now,'pid':pid,'phase':status.get('phase','run'),
+                              'stage':status.get('stage','starting'),
                               'stage_elapsed_seconds':max(0,now-status.get('stage_started',now)),
                               'seconds_since_observed_progress':age,'progress':status.get('progress',{}),
                               'details':status.get('details',{}),'current_phase_has_counter':status.get('current_phase_has_counter',False),**resources}

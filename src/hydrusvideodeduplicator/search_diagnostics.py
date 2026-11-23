@@ -26,8 +26,11 @@ class SearchDiagnostics:
                  max_events=100000, max_detailed_comparisons=1000):
         directory.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        self.path = directory / f"search-diagnostics-{stamp}-{uuid4().hex[:8]}.jsonl"
-        self.stream = self.path.open("x", encoding="utf-8")
+        run_id = f"{stamp}-{uuid4().hex[:8]}"
+        self.paths = {phase: directory / f"{phase}-diagnostics-{run_id}.jsonl"
+                      for phase in ("run", "hash", "tree", "search")}
+        self.streams = {phase: path.open("x", encoding="utf-8") for phase, path in self.paths.items()}
+        self.path = self.paths["run"]
         self.started = time.perf_counter()
         self.comparisons = self.file_comparisons = 0
         self.last_display = 0.0
@@ -66,7 +69,24 @@ class SearchDiagnostics:
                     '--interval',str(self.interval)],stdin=subprocess.DEVNULL)
             except OSError as error:
                 self.emit('monitor_unavailable', error_type=type(error).__name__, reason='frozen_executable' if getattr(sys,'frozen',False) else 'watchdog_start_failed')
-        tqdm.write(f"Stage diagnostics: {self.path}")
+        tqdm.write("Diagnostic logs: " + ", ".join(f"{phase}={path}" for phase, path in self.paths.items()))
+
+    def _phase_for(self, event, fields):
+        operation = fields.get("operation")
+        if event in ("session_start", "session_end", "monitor_unavailable"):
+            return "run"
+        if operation is not None:
+            if operation in {"hydrus_file_selection", "hashing_and_queueing", "video_fetch_and_hash",
+                             "video_download", "decode_and_perceptual_hash", "database_hash_queue_write"}:
+                return "hash"
+            if operation in {"search_tree_insertion", "tree_node_fetch", "tree_maintenance"}:
+                return "tree"
+            if operation in {"duplicate_search", "video_search_and_reporting", "native_comparison",
+                             "hydrus_relationship_submission"}:
+                return "search"
+        if self.operations:
+            return self.operations[-1]["phase"]
+        return "run"
 
     def _publish(self, force=False):
         now = time.monotonic()
@@ -78,6 +98,7 @@ class SearchDiagnostics:
             details.update(item['fields'])
             progress.update(item['progress'])
         data = {'stage':active['name'] if active else 'between stages',
+                'phase':active['phase'] if active else 'run',
                 'stage_started':active['started'] if active else self.last_progress_at,
                 'last_progress_at':self.last_progress_at,'closed':self.closed,
                 'progress':progress,'details':details,'current_phase_has_counter':bool(active and active['progress'])}
@@ -102,10 +123,12 @@ class SearchDiagnostics:
                 self.dropped_events += 1
                 return
             self.event_count += 1
+            phase = self._phase_for(event, fields)
             record = {'timestamp_utc':datetime.now(timezone.utc).isoformat(),
-                      'elapsed_seconds':time.perf_counter()-self.started,'event':event,**fields}
-            self.stream.write(json.dumps(record)+'\n')
-            self.stream.flush()
+                      'elapsed_seconds':time.perf_counter()-self.started,'event':event,'phase':phase,**fields}
+            stream = self.streams[phase]
+            stream.write(json.dumps(record)+'\n')
+            stream.flush()
 
     def progress(self, **fields):
         with self.lock:
@@ -119,7 +142,8 @@ class SearchDiagnostics:
     @contextmanager
     def operation(self, name: str, _detail=True, **fields):
         started = time.perf_counter()
-        item = {'name':name,'fields':fields,'started':time.monotonic(),'progress':{}}
+        item = {'name':name,'phase':self._phase_for('operation', {'operation':name}),
+                'fields':fields,'started':time.monotonic(),'progress':{}}
         with self.lock:
             self.operations.append(item)
             self.last_progress_at = time.monotonic()
@@ -197,9 +221,11 @@ class SearchDiagnostics:
         if self.status_file is not None: self.status_file.close()
         self.status_path.unlink(missing_ok=True)
         self.emit('session_end',comparisons_completed=self.comparisons,dropped_detail_events=self.dropped_events)
-        self.stream.close()
+        for stream in self.streams.values():
+            stream.close()
         summary = {'elapsed_seconds':time.perf_counter()-self.started,'comparisons':self.comparisons,
                    'dropped_detail_events':self.dropped_events,'stage_totals':self.totals,
                    'comparison_counter_scope':'Legacy video scoring calls; frame-index work has separate query counters.',
+                   'phase_logs':{phase:str(path) for phase,path in self.paths.items()},
                    'resource_file':str(self.resource_path),'watchdog_exit_code':self.worker.returncode if self.worker is not None else None,'timing_note':'Nested stage times overlap; do not sum inclusive durations.'}
         self.path.with_suffix('.summary.json').write_text(json.dumps(summary,indent=2)+'\n',encoding='utf-8')

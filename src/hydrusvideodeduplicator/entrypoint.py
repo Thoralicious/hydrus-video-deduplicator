@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import logging
 import atexit
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
+from enum import Enum
+import json
+import sqlite3
 from typing import TYPE_CHECKING, Annotated, List, Optional
 
 if TYPE_CHECKING:
@@ -42,6 +45,37 @@ Parameters:
 
 loaded_dotenv = load_dotenv()
 config = Config.load_from_env()
+
+
+class TestRunMode(str, Enum):
+    NEW = "new"
+    TEMP = "temp"
+    SAVE = "save"
+
+
+def prepare_test_database(directory: Path, mode: TestRunMode) -> Path:
+    if mode is TestRunMode.SAVE:
+        DedupeDB.set_db_name("videohashes.sqlite")
+        return directory / "videohashes.sqlite"
+
+    source = directory / "videohashes.sqlite"
+    target = directory / "test-videohashes.sqlite"
+    temporary = directory / ".test-videohashes.sqlite.tmp"
+    directory.mkdir(parents=True, exist_ok=True)
+    if mode is TestRunMode.TEMP and not source.is_file():
+        raise typer.BadParameter("--test-run temp requires an existing videohashes.sqlite database.")
+    for path in (target, Path(str(target) + "-wal"), Path(str(target) + "-shm"), temporary):
+        path.unlink(missing_ok=True)
+
+    if mode is TestRunMode.TEMP:
+        with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as source_db:
+            with closing(sqlite3.connect(temporary)) as target_db:
+                source_db.backup(target_db)
+                target_db.commit()
+        temporary.replace(target)
+
+    DedupeDB.set_db_name("test-videohashes.sqlite")
+    return target
 
 
 def main(
@@ -85,6 +119,9 @@ def main(
     ] = config.dedupe_database_dir,
     diagnostic_mode: Annotated[bool, typer.Option("--diagnostic-mode", help="Record program stages and resource usage.")] = False,
     diagnostics_interval: Annotated[float, typer.Option(help="Seconds between resource samples.")] = 2.0,
+    log_path: Annotated[Optional[Path], typer.Option(help="Directory for diagnostic and test-run JSON files.")] = None,
+    no_submit: Annotated[bool, typer.Option("--no-submit", help="Do not send duplicate relationships to Hydrus.")] = False,
+    test_run: Annotated[Optional[TestRunMode], typer.Option(help="Test mode: new, temp, or save.")] = None,
     verbose: Annotated[Optional[bool], typer.Option(help="Verbose logging")] = False,
     debug: Annotated[Optional[bool], typer.Option(hidden=True)] = False,
     gui: Annotated[  # This gui arg is unused, it's only here to show on --help. See run_main() for more info.
@@ -114,7 +151,15 @@ def main(
         logging.disable()
 
     DedupeDB.set_db_dir(dedup_database_dir)
-    diagnostics = SearchDiagnostics(dedup_database_dir, interval=diagnostics_interval) if diagnostic_mode else None
+    log_directory = log_path if log_path is not None else dedup_database_dir / "logs"
+    test_run_report_path = None
+    if test_run is not None:
+        if clear_search_cache or clear_search_tree:
+            raise typer.BadParameter("Search cache/tree clearing cannot be combined with --test-run.")
+        test_run_report_path = prepare_test_database(dedup_database_dir, test_run)
+    else:
+        DedupeDB.set_db_name("videohashes.sqlite")
+    diagnostics = SearchDiagnostics(log_directory, interval=diagnostics_interval) if diagnostic_mode else None
     if diagnostics is not None:
         atexit.register(diagnostics.close)
 
@@ -237,6 +282,7 @@ def main(
         custom_query=query,
     )
     deduper.diagnostics = diagnostics
+    deduper.no_submit = no_submit
 
     if debug:
         deduper.hydlog.setLevel(logging.DEBUG)
@@ -245,6 +291,14 @@ def main(
     try:
         with diagnostics.operation("deduplication") if diagnostics else nullcontext():
             num_similar_pairs = deduper.deduplicate(skip_hashing=skip_hashing)
+            if test_run_report_path is not None:
+                log_directory.mkdir(parents=True, exist_ok=True)
+                report_path = log_directory / "pairs.json"
+                rows = []
+                for (file_a, file_b), (score_a_to_b, score_b_to_a) in sorted(deduper.test_run_pairs.items()):
+                    rows.append({"file_a": file_a, "file_b": file_b,
+                                 "score_a_to_b": score_a_to_b, "score_b_to_a": score_b_to_a})
+                report_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
     finally:
         if diagnostics is not None:
             diagnostics.close()
@@ -302,4 +356,4 @@ def run_main(gui: bool, is_executable: bool):
 
 
 if __name__ == "__main__":
-    run_main(gui=False)
+    run_main(gui=False, is_executable=False)
