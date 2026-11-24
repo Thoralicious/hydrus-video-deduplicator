@@ -50,6 +50,9 @@ exclude = [
   "/tests",
 ]
 
+[tool.hatch.metadata]
+allow-direct-references = true
+
 [tool.hatch.version]
 path = "src/hydrusvideodeduplicator/__about__.py"
 
