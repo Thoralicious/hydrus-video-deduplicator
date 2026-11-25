@@ -13,7 +13,9 @@ ENV VIRTUAL_ENV=/opt/venv
 RUN python3 -m venv $VIRTUAL_ENV
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
-RUN python -m pip install hydrusvideodeduplicator
+COPY pyproject.toml README.md ./
+COPY src ./src
+RUN python -m pip install .
 COPY ./docker-entrypoint.sh ./entrypoint.sh
 
 ENV DEDUP_DATABASE_DIR=/usr/src/app/db
