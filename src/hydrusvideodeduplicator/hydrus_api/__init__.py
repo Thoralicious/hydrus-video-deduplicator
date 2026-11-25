@@ -349,6 +349,7 @@ class Client:
         api_url: str = DEFAULT_API_URL,
         session: T.Optional[requests.Session] = None,
         verify_cert: T.Optional[str] = None,  # Path to cert
+        request_timeout: float | tuple[float, float] = (5, 60),
     ) -> None:
         """
         See https://hydrusnetwork.github.io/hydrus/client_api.html for documentation.
@@ -357,9 +358,13 @@ class Client:
         self.access_key = access_key
         self.api_url = api_url.rstrip("/")
         self._verify_cert = verify_cert
+        self._request_timeout = request_timeout
         self.session = session or requests.Session()
 
     def _api_request(self, method: str, path: str, **kwargs: T.Any) -> requests.Response:
+        # Keep a stalled local API from blocking a run forever. Applications
+        # with slower transfers can configure a larger timeout on Client.
+        kwargs.setdefault("timeout", self._request_timeout)
         if self.access_key is not None:
             kwargs.setdefault("headers", {}).update({"Hydrus-Client-API-Access-Key": self.access_key})
 
