@@ -86,11 +86,17 @@ class FrameSearchState:
             'SELECT file_hash FROM completed WHERE context=? AND min_score<=?', (context,cutoff))}
 
     def finish_query(self, context, file_hashes, digests, cutoff):
+        self.finish_queries(context, [file_hashes], digests, cutoff)
+
+    def finish_queries(self, context, query_file_hashes, digests, cutoff):
+        """Checkpoint several completed collections in one transaction."""
+        rows = ((context, file_hash, digests[file_hash], cutoff)
+                for file_hashes in query_file_hashes for file_hash in file_hashes)
         with self.connection:
             self.connection.executemany('''INSERT INTO completed VALUES (?,?,?,?)
                 ON CONFLICT(context,file_hash) DO UPDATE SET digest=excluded.digest,
                 min_score=MIN(completed.min_score,excluded.min_score)''',
-                ((context,key,digests[key],cutoff) for key in file_hashes))
+                rows)
 
     def already_submitted(self, context, hash_a, hash_b, digests):
         left,right = sorted((hash_a,hash_b))

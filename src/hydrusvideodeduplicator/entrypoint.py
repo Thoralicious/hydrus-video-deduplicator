@@ -32,6 +32,8 @@ from hydrusvideodeduplicator.frame_index_search import (
     FrameIndexError,
     similarity_cutoff,
     validate_frame_index_workers,
+    validate_progress_batch_size,
+    validate_batch_interval_seconds,
 )
 from hydrusvideodeduplicator.frame_index_state import reset_frame_search_state, state_path_for
 from hydrusvideodeduplicator.search_diagnostics import SearchDiagnostics
@@ -153,6 +155,8 @@ def main(
     test_run: Annotated[Optional[TestRunMode], typer.Option(help="Test mode: new, temp, or save. Duplicate submissions are disabled by default.")] = None,
     use_vptree: Annotated[bool, typer.Option("--use-vptree", help="Use the legacy VP-tree search instead of the EFI default.")] = False,
     frame_index_workers: Annotated[int, typer.Option(help="EFI worker count; negative values mean all but N logical CPUs.")] = -2,
+    efi_progress_batch_size: Annotated[int, typer.Option("--efi-progress-batch-size", help="EFI query collections to checkpoint together; interruptions may replay the unfinished batch.")] = 32,
+    batch_interval_seconds: Annotated[float, typer.Option("--batch-interval-seconds", help="Checkpoint completed EFI queries after this interval; checked after each collection finishes.")] = 1.0,
     verbose: Annotated[Optional[bool], typer.Option(help="Verbose logging")] = False,
     debug: Annotated[Optional[bool], typer.Option(hidden=True)] = False,
     gui: Annotated[  # This gui arg is unused, it's only here to show on --help. See run_main() for more info.
@@ -203,6 +207,14 @@ def main(
             similarity_cutoff(threshold)
         except FrameIndexError as error:
             raise typer.BadParameter(str(error), param_hint="--threshold") from error
+        try:
+            validate_progress_batch_size(efi_progress_batch_size)
+        except FrameIndexError as error:
+            raise typer.BadParameter(str(error), param_hint="--efi-progress-batch-size") from error
+        try:
+            validate_batch_interval_seconds(batch_interval_seconds)
+        except FrameIndexError as error:
+            raise typer.BadParameter(str(error), param_hint="--batch-interval-seconds") from error
 
     # CLI debug parameter sets log level to info or debug
     loglevel = logging.INFO
@@ -373,6 +385,8 @@ def main(
     deduper.frame_index = not use_vptree
     deduper.frame_index_workers = frame_index_workers
     deduper.frame_index_persist_progress = test_run is not None
+    deduper.frame_index_progress_batch_size = efi_progress_batch_size
+    deduper.frame_index_batch_interval_seconds = batch_interval_seconds
     deduper.log_directory = log_directory
 
     if debug:

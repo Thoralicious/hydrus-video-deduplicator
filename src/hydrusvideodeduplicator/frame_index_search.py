@@ -77,6 +77,18 @@ def validate_frame_index_workers(value):
         raise FrameIndexError('Parallel EFI requires a compatible hvdaccelerators build; use 1 worker for serial EFI.')
     return count
 
+
+def validate_progress_batch_size(value):
+    if not isinstance(value, int) or value < 1 or value > 4096:
+        raise FrameIndexError('EFI progress batch size must be between 1 and 4096 collections.')
+    return value
+
+
+def validate_batch_interval_seconds(value):
+    if value is not None and (not math.isfinite(value) or value <= 0):
+        raise FrameIndexError('EFI batch interval must be a positive number of seconds.')
+    return value
+
 class HashProgress:
     """Work-weighted estimate scoped to this invocation's pending queries."""
     def __init__(self, total):
@@ -215,7 +227,8 @@ def _run_frame_index(database: Path, *, threshold=50.0, query_hashes=None,
                      diagnostics=None, submit_pair=None, context=None,
                      acquire_lock=True, should_skip=None, progress=None, workers=1,
                      output_directory=None, record_pair=None, submission_enabled=True,
-                     persist_progress=False):
+                     persist_progress=False, progress_batch_size=32,
+                     batch_interval_seconds=1.0):
     cutoff = similarity_cutoff(threshold)
     track_state = submit_pair is not None and (submission_enabled or persist_progress)
     if track_state and not context:
@@ -225,9 +238,13 @@ def _run_frame_index(database: Path, *, threshold=50.0, query_hashes=None,
     index = None
     pair_store = None
     pair_store_path = None
+    progress_batch = []
+    progress_batch_started = None
     if not hasattr(vpdq, 'ExactFrameIndex'):
         raise FrameIndexError('Frame-index search requires the modified hvdaccelerators build.')
     workers = validate_frame_index_workers(workers)
+    progress_batch_size = validate_progress_batch_size(progress_batch_size)
+    batch_interval_seconds = validate_batch_interval_seconds(batch_interval_seconds)
     selected = {file_hash_text(value) for value in query_hashes} if query_hashes else None
     database = Path(database).resolve(strict=True)
     started = time.perf_counter()
@@ -238,10 +255,33 @@ def _run_frame_index(database: Path, *, threshold=50.0, query_hashes=None,
               'mode': 'submit' if submit_pair is not None and submission_enabled else 'no_submit',
               'algorithm': ALGORITHM, 'database': str(database), 'workers': workers,
               'requested_threshold': threshold, 'effective_integer_threshold': cutoff,
+              'progress_batch_size': progress_batch_size,
+              'batch_interval_seconds': batch_interval_seconds,
+              'progress_batches_committed': 0,
+              'progress_query_collections_committed': 0,
               'unique_pairs': 0, 'submitted_pairs': 0, 'ledger_skips': 0, 'completed_query_collections': 0,
               'coverage': 'All cached files, including queued hashes. Old VP-tree progress is not used.',
               'scope': 'Cached perceptual hashes; no Hydrus tag-query or current-file-presence filtering.'}
     directory.mkdir(parents=True, exist_ok=False)
+
+    def commit_progress_batch():
+        nonlocal progress_batch_started
+        if not progress_batch:
+            return
+        batch_count = len(progress_batch)
+        batch_file_count = sum(map(len, progress_batch))
+        with diagnostics.operation('exact_query_commit', collections=batch_count,
+                                   files=batch_file_count) if diagnostics is not None else nullcontext():
+            state.finish_queries(context, progress_batch, digests, cutoff)
+        progress_batch.clear()
+        progress_batch_started = time.perf_counter()
+        report['progress_batches_committed'] += 1
+        report['progress_query_collections_committed'] += batch_count
+        if diagnostics is not None:
+            diagnostics.emit('frame_index_progress_checkpoint',
+                             collections=batch_count,
+                             total_collections_committed=report['progress_query_collections_committed'])
+
     try:
         with (database_lock(database) if acquire_lock else nullcontext()), closing(sqlite3.connect(database.as_uri()+'?mode=ro', uri=True)) as connection:
             connection.execute('PRAGMA query_only=ON')
@@ -343,6 +383,8 @@ def _run_frame_index(database: Path, *, threshold=50.0, query_hashes=None,
                     if score_b_to_a is not None:
                         record_pair_result(pair_store, matches, hash_b, hash_a, score_b_to_a)
                 report['unique_pairs'] = pair_store.execute('SELECT COUNT(*) FROM pairs').fetchone()[0]
+                if state is not None:
+                    progress_batch_started = time.perf_counter()
                 for ordinal, group in enumerate(tqdm(query_groups, desc='Searching frame index', unit='collection'), 1):
                     if should_skip is not None and should_skip(): raise KeyboardInterrupt
                     if progress is not None: progress(ordinal-1,len(query_groups))
@@ -394,15 +436,18 @@ def _run_frame_index(database: Path, *, threshold=50.0, query_hashes=None,
 
                     matches.flush()
                     pair_store.commit()
-                    if state is not None:
-                        with diagnostics.operation('exact_query_commit') if diagnostics is not None else nullcontext():
-                            state.finish_query(context, query_files, digests, cutoff)
                     query_record['total_seconds'] = time.perf_counter()-lookup_started
                     queries.write(json.dumps(query_record)+'\n')
                     queries.flush()
                     query_events.write(json.dumps({'event':'query_complete','timestamp_utc':datetime.now(timezone.utc).isoformat(),**query_record})+'\n'); query_events.flush()
                     report['active_query'] = None
                     report['completed_query_collections'] += 1
+                    if state is not None:
+                        progress_batch.append(query_files)
+                        interval_due = (batch_interval_seconds is not None
+                                        and time.perf_counter()-progress_batch_started >= batch_interval_seconds)
+                        if len(progress_batch) >= progress_batch_size or interval_due:
+                            commit_progress_batch()
                     hash_progress.finish(len(query)//32, index_seconds)
                     snapshot = hash_progress.snapshot()
                     hash_bar.update(max(0, snapshot['observed_query_frame_hashes']-hash_bar.n))
@@ -411,6 +456,8 @@ def _run_frame_index(database: Path, *, threshold=50.0, query_hashes=None,
                     if diagnostics is not None:
                         diagnostics.emit('frame_index_query_complete', **query_record)
                 else:
+                    if state is not None:
+                        commit_progress_batch()
                     report['status'] = 'complete'
                     report['complete'] = True
     except KeyboardInterrupt:
@@ -423,6 +470,7 @@ def _run_frame_index(database: Path, *, threshold=50.0, query_hashes=None,
             report['error'] = str(error)
     finally:
         if state is not None: state.close()
+        report['progress_query_collections_uncheckpointed'] = len(progress_batch)
         if pair_store is not None:
             pair_store.close()
             pair_store_path.unlink(missing_ok=True)
@@ -444,10 +492,13 @@ def run_frame_index_search(database: Path, submit_pair, *, context, threshold=50
                            query_hashes=None, diagnostics=None,
                            should_skip=None, progress=None, workers=1,
                            output_directory=None, record_pair=None, submission_enabled=True,
-                           persist_progress=False, acquire_lock=True):
+                           persist_progress=False, acquire_lock=True, progress_batch_size=32,
+                           batch_interval_seconds=1.0):
     """Search the complete cached frame index and optionally submit its unique pairs."""
     return _run_frame_index(database, threshold=threshold, query_hashes=query_hashes,
                             diagnostics=diagnostics, submit_pair=submit_pair,
                             context=context, acquire_lock=acquire_lock, should_skip=should_skip, progress=progress,
                             workers=workers, output_directory=output_directory, record_pair=record_pair,
-                            submission_enabled=submission_enabled, persist_progress=persist_progress)
+                            submission_enabled=submission_enabled, persist_progress=persist_progress,
+                            progress_batch_size=progress_batch_size,
+                            batch_interval_seconds=batch_interval_seconds)

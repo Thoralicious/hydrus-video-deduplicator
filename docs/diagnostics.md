@@ -53,6 +53,7 @@ Event records include a UTC timestamp, elapsed seconds since startup, event name
 - file-hashing totals and current progress;
 - local-path lookup/use/fallback, HTTP download byte count, and decode/hash duration;
 - EFI collections fingerprinted/added, index build details, and query counters such as completed frame hashes, Hamming checks, and posting visits;
+- EFI progress checkpoint batches and the number of query collections committed;
 - duplicate-search progress, comparison counts, and selected comparison details (up to 1,000 by default);
 - watchdog resource samples, including resident memory, CPU time/percentage, process I/O counters where available, and sampled/lifetime peaks where supported.
 

@@ -489,6 +489,8 @@ class HydrusVideoDeduplicator:
         self.frame_index = True
         self.frame_index_workers = -2
         self.frame_index_persist_progress = False
+        self.frame_index_progress_batch_size = 32
+        self.frame_index_batch_interval_seconds = 1.0
         self.log_directory = self.db.db_dir / "logs"
         self.client = client
         self.similarity_threshold = similarity_threshold
@@ -878,6 +880,8 @@ class HydrusVideoDeduplicator:
                 record_pair=record_pair,
                 submission_enabled=self.submit_results,
                 persist_progress=self.frame_index_persist_progress,
+                progress_batch_size=self.frame_index_progress_batch_size,
+                batch_interval_seconds=self.frame_index_batch_interval_seconds,
                 acquire_lock=False,
             )
             if not result["complete"]:
