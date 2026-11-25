@@ -40,8 +40,29 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
+  build_wheels:
+    name: Build native wheels on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+    - uses: actions/checkout@v6
+    - name: Build wheels
+      uses: pypa/cibuildwheel@v3.4.0
+      env:
+        CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
+        CIBW_SKIP: "*-musllinux_* *-win32"
+        CIBW_ARCHS: auto64
+        CIBW_TEST_COMMAND: "python -c \"from hydrusvideodeduplicator import _native; assert _native.matchHashBytes(bytes(32), bytes(32), 31) == 100\""
+    - uses: actions/upload-artifact@v7
+      with:
+        name: dist-${{ matrix.os }}
+        path: wheelhouse/*.whl
+        if-no-files-found: error
+
   deploy:
-    needs: [build_sdist]
+    needs: [build_sdist, build_wheels]
     runs-on: ubuntu-24.04
     environment:
       name: pypi
@@ -53,7 +74,7 @@ jobs:
     - name: Download packages
       uses: actions/download-artifact@v8
       with:
-        name: dist-sdist
+        pattern: dist-*
         path: dist/
         merge-multiple: true
 

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.26", "scikit-build-core[hatchling]>=1.0", "pybind11>=3.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -30,7 +30,6 @@ dependencies = [
     "requests",
     # vpdqpy dependencies
     "av",
-    "hvdaccelerators @ git+https://github.com/Thoralicious/hvdaccelerators.git@1851cfbf4a59926b9b5e7f4fe7793effc668db9e",
 ]
 
 [project.optional-dependencies]
@@ -50,8 +49,10 @@ exclude = [
   "/tests",
 ]
 
-[tool.hatch.metadata]
-allow-direct-references = true
+[tool.hatch.build.targets.wheel.hooks.scikit-build]
+minimum-version = "1.0"
+cmake.source-dir = "native"
+cmake.build-type = "RelWithDebInfo"
 
 [tool.hatch.version]
 path = "src/hydrusvideodeduplicator/__about__.py"
@@ -93,10 +94,12 @@ gh-deploy = "mkdocs gh-deploy --force --strict --config-file mkdocs-gh-pages.yml
 dependencies = [
     "pytest",
     "vcrpy", # for replaying saved api requests/responses
+    "pillow", # known-image native hashing tests
 ]
 
 [tool.hatch.envs.test.scripts]
-all = "python -m pytest tests/unit_tests/test_db.py tests/unit_tests/test_regressions.py tests/unit_tests/test_vpdqpy.py tests/acceptance_tests/test_dedupe.py tests/acceptance_tests/test_main_vcr.py --verbose {args}"
+all = "python -m pytest tests/native tests/unit_tests/test_db.py tests/unit_tests/test_regressions.py tests/unit_tests/test_vpdqpy.py tests/acceptance_tests/test_dedupe.py tests/acceptance_tests/test_main_vcr.py --verbose {args}"
+native = "python -m pytest tests/native --verbose {args}"
 db = "python -m pytest tests/unit_tests/test_db.py --verbose {args}"
 regressions = "python -m pytest tests/unit_tests/test_regressions.py --verbose {args}"
 vpdq = "python -m pytest tests/unit_tests/test_vpdqpy.py --verbose {args}"

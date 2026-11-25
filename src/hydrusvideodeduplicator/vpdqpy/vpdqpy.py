@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import av
-from hvdaccelerators import vpdq
+from hydrusvideodeduplicator import _native as vpdq
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

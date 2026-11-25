@@ -4,11 +4,15 @@ import os
 
 # Use __main__.py rather than the CLI exe entrypoint. The CLI exe entrypoint waits for ENTER before
 # exiting, which is helpful when Windows closes the console window but just gets in the way here.
+from PyInstaller.utils.hooks import collect_data_files
+from hydrusvideodeduplicator import _native
+
 a = Analysis(
     [os.path.join(SPECPATH, '..', '..', 'src', 'hydrusvideodeduplicator', '__main__.py')],
     pathex=[],
-    binaries=[],
-    datas=[],
+    # Editable/source checkouts can keep the extension outside the source package.
+    binaries=[(_native.__file__, "hydrusvideodeduplicator")],
+    datas=collect_data_files("hydrusvideodeduplicator", includes=["_licenses/*"]),
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

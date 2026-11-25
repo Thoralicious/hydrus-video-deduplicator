@@ -5,7 +5,6 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
-import importlib.metadata
 import mmap
 import os
 import platform
@@ -17,6 +16,7 @@ import time
 from uuid import uuid4
 
 from .diagnostic_watchdog import HEADER, STATUS_SIZE
+from . import _native
 
 from tqdm import tqdm
 
@@ -50,10 +50,7 @@ class SearchDiagnostics:
         self.last_publish = 0.0
         self.resource_path = self.path.with_suffix('.resources.jsonl')
         self.status_path = self.path.with_suffix('.status')
-        try:
-            accelerator_version = importlib.metadata.version('hvdaccelerators')
-        except importlib.metadata.PackageNotFoundError:
-            accelerator_version = None
+        accelerator_version = 'bundled-' + _native.__source_commit__[:12]
         self.emit("session_start", python_version=platform.python_version(), platform=platform.platform(),
                   accelerator_version=accelerator_version,
                   logical_cpus=os.cpu_count(), interval_seconds=self.interval,

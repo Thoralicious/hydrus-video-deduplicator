@@ -26,6 +26,12 @@ hatch run test:vcr
 
 See [pyproject.toml](../pyproject.toml) test.scripts for full list of test groups.
 
+## Bundled native tests
+
+`hatch run test:native` checks PDQ hashing, lossless-video hashing, packed-hash conversions,
+and serial/parallel EFI results, counters, cancellation, and reuse. Its small image and cached-hash
+fixtures live in `tests/native`; these tests do not need the Hydrus `testdb` submodule.
+
 ## Result-submission and search regression tests
 
 `tests/unit_tests/test_regressions.py` uses disposable databases and mocked Hydrus submissions. Run it without the media/VCR fixtures:

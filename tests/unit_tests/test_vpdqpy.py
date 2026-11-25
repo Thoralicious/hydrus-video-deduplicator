@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING
 
 from hydrusvideodeduplicator.vpdqpy.vpdqpy import Vpdq, VpdqHash
 
-from hvdaccelerators import vpdq
+from hydrusvideodeduplicator import _native as vpdq
 
 from ..check_testdb import check_testdb_exists
 

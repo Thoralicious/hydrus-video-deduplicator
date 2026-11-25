@@ -4,7 +4,8 @@ RUN apt-get update && apt-get install -y \
     python3 \
     python3-pip \
     python3-venv \
-    git \
+    python3-dev \
+    build-essential \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
@@ -15,6 +16,7 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 COPY pyproject.toml README.md ./
 COPY src ./src
+COPY native ./native
 RUN python -m pip install .
 COPY ./docker-entrypoint.sh ./entrypoint.sh
 

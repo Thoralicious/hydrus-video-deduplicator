@@ -6,6 +6,14 @@
 
 It is used for packaging and environment management for development.
 
+HVD builds its bundled C++17 extension during installation. Source builds need a C++ compiler
+(Visual Studio C++ Build Tools on Windows, GCC on Linux, or Xcode Command Line Tools on macOS).
+CMake, pybind11, and the Hatch build plugin are build requirements installed automatically by pip/uv.
+On Ubuntu, install `build-essential` and `python3-dev` before installing from source.
+There is no separate `hvdaccelerators` package or Git dependency to install.
+
+The imported source revision and licenses are documented in [native/README.md](../native/README.md).
+
 There are hatch commands for this project are defined in the [pyproject.toml]. They are just aliases for other commands that run in specific environments.
 
 For example, to run the command to generate the documentation and serve it locally:
@@ -24,6 +32,12 @@ Run all tests:
 
 ```sh
 hatch run test:all
+```
+
+Run the bundled hashing and serial/parallel EFI tests without the Hydrus media submodule:
+
+```sh
+hatch run test:native
 ```
 
 Serve documentation locally:

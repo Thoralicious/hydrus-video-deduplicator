@@ -14,7 +14,7 @@ import time
 from urllib.parse import urlsplit, urlunsplit
 from uuid import uuid4
 
-from hvdaccelerators import vpdq
+from hydrusvideodeduplicator import _native as vpdq
 from tqdm import tqdm
 
 from .__about__ import __version__
@@ -72,9 +72,9 @@ def validate_frame_index_workers(value):
     if count > 256:
         raise FrameIndexError('Resolved EFI worker count must not exceed 256.')
     if not hasattr(vpdq, 'ExactFrameIndex'):
-        raise FrameIndexError('EFI requires a compatible hvdaccelerators build with ExactFrameIndex.')
+        raise FrameIndexError('The bundled native extension is missing ExactFrameIndex; rebuild or reinstall HVD.')
     if count > 1 and not hasattr(vpdq.ExactFrameIndex, 'parallel_stats'):
-        raise FrameIndexError('Parallel EFI requires a compatible hvdaccelerators build; use 1 worker for serial EFI.')
+        raise FrameIndexError('The bundled native extension lacks parallel EFI; rebuild or reinstall HVD.')
     return count
 
 
@@ -241,7 +241,7 @@ def _run_frame_index(database: Path, *, threshold=50.0, query_hashes=None,
     progress_batch = []
     progress_batch_started = None
     if not hasattr(vpdq, 'ExactFrameIndex'):
-        raise FrameIndexError('Frame-index search requires the modified hvdaccelerators build.')
+        raise FrameIndexError('The bundled native extension is missing ExactFrameIndex; rebuild or reinstall HVD.')
     workers = validate_frame_index_workers(workers)
     progress_batch_size = validate_progress_batch_size(progress_batch_size)
     batch_interval_seconds = validate_batch_interval_seconds(batch_interval_seconds)

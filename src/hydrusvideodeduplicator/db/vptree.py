@@ -6,7 +6,7 @@ import random
 import sqlite3
 from typing import TYPE_CHECKING
 
-from hvdaccelerators import vpdq
+from hydrusvideodeduplicator import _native as vpdq
 
 if TYPE_CHECKING:
     from collections.abc import Collection, Iterable

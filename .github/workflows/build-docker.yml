@@ -1,5 +1,5 @@
 # Test that the Dockerfile builds successfully.
-# This does not test that the newest Python changes work, since the package is installed from pypi.
+# The image builds the current Python package and its bundled native extension from source.
 
 on:
   push:
@@ -8,6 +8,9 @@ on:
       - develop
     paths:
       - Dockerfile
+      - native/**
+      - src/**
+      - pyproject.toml
       - docker-entrypoint.sh
       - .github/workflows/build-docker.yml
   pull_request:
@@ -16,6 +19,9 @@ on:
       - develop
     paths:
       - Dockerfile
+      - native/**
+      - src/**
+      - pyproject.toml
       - docker-entrypoint.sh
       - .github/workflows/build-docker.yml
   workflow_dispatch:

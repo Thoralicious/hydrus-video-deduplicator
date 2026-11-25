@@ -2,11 +2,15 @@
 
 import os
 
+from PyInstaller.utils.hooks import collect_data_files
+from hydrusvideodeduplicator import _native
+
 a = Analysis(
     [os.path.join(SPECPATH, '..', '..', 'src', 'hydrusvideodeduplicator', 'gui_exe_entrypoint.py')],
     pathex=[],
-    binaries=[],
-    datas=[],
+    # Editable/source checkouts can keep the extension outside the source package.
+    binaries=[(_native.__file__, "hydrusvideodeduplicator")],
+    datas=collect_data_files("hydrusvideodeduplicator", includes=["_licenses/*"]),
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},

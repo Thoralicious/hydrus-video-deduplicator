@@ -17,6 +17,9 @@ The following instructions are written for Ubuntu, but should be similar for mos
 ### Dependencies
 
 - Python >=3.10
+- Source installs compile the bundled C++17 extension and need a compiler plus Python development headers.
+  On Ubuntu, install `build-essential python3-dev`; on macOS, install Xcode Command Line Tools.
+  Prebuilt wheels and standalone executables do not require a compiler.
 
 ### Steps
 

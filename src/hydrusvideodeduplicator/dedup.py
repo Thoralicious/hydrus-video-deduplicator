@@ -36,7 +36,7 @@ from .db_lock import DatabaseBusyError, database_lock
 from .frame_index_search import FrameIndexError, run_frame_index_search, service_context
 from .hashing import compute_phash
 from .page_logger import HydrusPageLogger
-from hvdaccelerators import vpdq
+from hydrusvideodeduplicator import _native as vpdq
 
 
 @dataclass
