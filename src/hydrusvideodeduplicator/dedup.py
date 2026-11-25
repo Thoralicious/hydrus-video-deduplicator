@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+import requests
 from rich import print
 from tqdm import tqdm
 
@@ -63,11 +64,17 @@ class FileHasher:
         self.num_threads = num_threads
 
     def _fetch_file(self, file_hash: str):
+        response = None
         try:
             response = self.client.client.get_file(hash_=file_hash)
+            return response.content
         except hydrus_api.HydrusAPIException as exc:
             raise HydrusApiException(exc)
-        return response.content
+        except requests.RequestException as exc:
+            raise HydrusApiException(exc)
+        finally:
+            if response is not None:
+                response.close()
 
     def _phash_file(self, file: bytes) -> bytes:
         try:
