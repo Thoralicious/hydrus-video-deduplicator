@@ -712,9 +712,11 @@ class VpTreeManager:
 
             num_cycles = 0
             total_nodes_searched = 0
+            cycle_detected = False
 
             for search_perceptual_hash in search_perceptual_hashes:
                 next_potentials = [self._root_node_perceptual_hash_id]
+                visited_node_ids = set()
 
                 while len(next_potentials) > 0:
                     current_potentials = next_potentials
@@ -733,11 +735,16 @@ class VpTreeManager:
                     self._try_to_populate_perceptual_hash_to_vptree_node_cache(current_potentials)
 
                     for node_perceptual_hash_id in current_potentials:
+                        if node_perceptual_hash_id in visited_node_ids:
+                            cycle_detected = True
+                            continue
+                        visited_node_ids.add(node_perceptual_hash_id)
+
                         if node_perceptual_hash_id not in self._perceptual_hash_id_to_vp_tree_node_cache:
                             # something crazy happened, probably a broken tree branch, move on
                             continue
 
-                        (node_perceptual_hash, node_radius, inner_perceptual_hash_id, outer_perceptual_hash_id) = (
+                        (node_perceptual_hash, _, inner_perceptual_hash_id, outer_perceptual_hash_id) = (
                             self._perceptual_hash_id_to_vp_tree_node_cache[node_perceptual_hash_id]
                         )
 
@@ -758,32 +765,15 @@ class VpTreeManager:
                                     node_hamming_distance
                                 )
 
-                        # now how about its children--where should we search next?
+                        # The directional video score is not a metric, so VP-tree sphere
+                        # pruning cannot guarantee complete results. Visit both branches.
+                        if inner_perceptual_hash_id is not None:
+                            next_potentials.append(inner_perceptual_hash_id)
+                        if outer_perceptual_hash_id is not None:
+                            next_potentials.append(outer_perceptual_hash_id)
 
-                        if node_radius is not None:
-                            # we have two spheres--node and search--their centers separated by node_hamming_distance
-                            # we want to search inside/outside the node_sphere if the search_sphere intersects with those spaces  # noqa: E501
-                            # there are four possibles:
-                            # (----N----)-(--S--)    intersects with outer only - distance between N and S > their radii
-                            # (----N---(-)-S--)      intersects with both
-                            # (----N-(--S-)-)        intersects with both
-                            # (---(-N-S--)-)         intersects with inner only - distance between N and S + radius_S does not exceed radius_N  # noqa: E501
-
-                            if inner_perceptual_hash_id is not None:
-                                spheres_disjoint = node_hamming_distance > (node_radius + search_radius)
-
-                                if not spheres_disjoint:  # i.e. they intersect at some point
-                                    next_potentials.append(inner_perceptual_hash_id)
-
-                            if outer_perceptual_hash_id is not None:
-                                search_sphere_subset_of_node_sphere = (
-                                    node_hamming_distance + search_radius
-                                ) <= node_radius
-
-                                if (
-                                    not search_sphere_subset_of_node_sphere
-                                ):  # i.e. search sphere intersects with non-node sphere space at some point
-                                    next_potentials.append(outer_perceptual_hash_id)
+            if cycle_detected:
+                log.warning("Cycle detected while traversing the search tree; repeated nodes were skipped.")
 
             log.debug(f"Similar file search touched {total_nodes_searched} nodes over {num_cycles} cycles.")
 
