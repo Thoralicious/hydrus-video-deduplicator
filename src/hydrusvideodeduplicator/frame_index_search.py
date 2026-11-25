@@ -313,7 +313,7 @@ def _run_frame_index(database: Path, *, threshold=50.0, query_hashes=None,
                 report['fingerprint_seconds'] = time.perf_counter()-fingerprint_started
                 state = FrameSearchState(state_path_for(database))
                 report['coverage_invalidated'] = state.prepare(digests)
-                pending_to_replay = state.pending_pairs(context)
+                pending_to_replay = state.pending_pairs(context, cutoff)
                 if submission_enabled:
                     for hash_a, hash_b, score_a_to_b, score_b_to_a in pending_to_replay:
                         if should_skip is not None and should_skip():

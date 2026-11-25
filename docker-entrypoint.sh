@@ -12,9 +12,7 @@ if [[ -n "${FAILED_PAGE_NAME:-}" ]]; then command+=(--failed-page-name "$FAILED_
 if [[ -n "${DEDUP_DATABASE_DIR:-}" ]]; then command+=(--dedup-database-dir "$DEDUP_DATABASE_DIR"); fi
 
 if [[ "${SKIP_HASHING:-false}" == "true" ]]; then
-    command+=(--skip-hashing)
-else
-    command+=(--no-skip-hashing)
+    command+=(--skip hash)
 fi
 if [[ "${CLEAR_SEARCH_TREE:-false}" == "true" ]]; then
     command+=(--clear-search-tree)

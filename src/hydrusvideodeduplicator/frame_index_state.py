@@ -121,9 +121,14 @@ class FrameSearchState:
             self.connection.execute(f'UPDATE pending SET {column}=? WHERE context=? AND hash_a=? AND hash_b=?',
                                     (float(score),context,left,right))
 
-    def pending_pairs(self, context):
-        return self.connection.execute('''SELECT hash_a,hash_b,score_a_to_b,score_b_to_a
-            FROM pending WHERE context=? ORDER BY hash_a,hash_b''', (context,)).fetchall()
+    def pending_pairs(self, context, cutoff=0):
+        # Preserve lower-scoring pending directions for a later, less strict run.
+        return self.connection.execute('''SELECT hash_a,hash_b,
+            CASE WHEN score_a_to_b>=:cutoff THEN score_a_to_b END,
+            CASE WHEN score_b_to_a>=:cutoff THEN score_b_to_a END
+            FROM pending WHERE context=:context
+            AND (score_a_to_b>=:cutoff OR score_b_to_a>=:cutoff)
+            ORDER BY hash_a,hash_b''', {'context': context, 'cutoff': cutoff}).fetchall()
 
 
 def reset_frame_search_state(path: Path):

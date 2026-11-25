@@ -52,6 +52,8 @@ Normal runs submit duplicate relationships by default. Test runs default to **no
 
 To allow a test run to submit duplicate relationships, explicitly add `--submit-results true`. Add `--submit-results false` to disable submissions during a normal run too. HVD prints whether results will be submitted before processing.
 
+With `--use-vptree`, runs without submissions leave live search progress unchanged so a later submission run can still report the discovered pairs.
+
 EFI query progress is checkpointed after 32 collections or 1 second since the last checkpoint, whichever comes first. Set `--efi-progress-batch-size` to change the collection limit and `--batch-interval-seconds` to change the time interval. The timer is checked after a collection finishes, so one long collection can delay its checkpoint. If interrupted, HVD may repeat completed queries since the last checkpoint, but their results remain safe to recompute.
 
 Use `--skip search` to hash selected videos and stop before EFI index construction and duplicate search. Use `--skip hash` to search using hashes already stored in the database, without hashing new videos.

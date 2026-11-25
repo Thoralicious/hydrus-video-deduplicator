@@ -26,13 +26,28 @@ hatch run test:vcr
 
 See [pyproject.toml](../pyproject.toml) test.scripts for full list of test groups.
 
-## Planned test: result-submission defaults
+## Result-submission and search regression tests
 
-Add this case when the CLI or Hydrus submission tests are next expanded. Use a mocked submission callback so verifying the normal-run default cannot send duplicate relationships to a live Hydrus instance.
+`tests/unit_tests/test_regressions.py` uses disposable databases and mocked Hydrus submissions. Run it without the media/VCR fixtures:
 
-- With `--submit-results` omitted in a normal run, verify submissions are enabled and the CLI says duplicate results will be submitted.
-- With it omitted for each `--test-run` mode (`new`, `temp`, and `save`), verify submissions are disabled, the CLI says duplicate results will NOT be submitted, and test-run JSON output is still written.
-- Verify explicit `--submit-results true` and `--submit-results false` override both defaults, and reject any other value.
+```sh
+hatch run test:regressions
+```
+
+Or run it directly in an environment with the project and its test dependencies installed:
+
+```sh
+python -m pytest tests/unit_tests/test_regressions.py
+```
+
+Coverage includes:
+
+- Normal-run and test-run submission defaults, explicit overrides, invalid values, and CLI messages.
+- Test-run JSON reports and disabled in-memory pair collection during normal runs.
+- EFI pending-pair thresholds, directional reports, and retries after failed submissions.
+- Legacy incremental-search cancellation, submission failures, and later submission after a dry run.
+- Relative-path test-database copies and preservation of an existing test database when its source is missing.
+- Docker entrypoint argument parsing with and without hashing enabled (requires Bash).
 
 ---
 

@@ -68,6 +68,7 @@ class SkipStage(str, Enum):
 
 
 def prepare_test_database(directory: Path, mode: TestRunMode) -> Path:
+    directory = directory.resolve()
     if mode is TestRunMode.SAVE:
         DedupeDB.set_db_name("videohashes.sqlite")
         return directory / "videohashes.sqlite"
@@ -382,6 +383,7 @@ def main(
     )
     deduper.diagnostics = diagnostics
     deduper.submit_results = submission_enabled
+    deduper.collect_test_run_pairs = test_run is not None
     deduper.frame_index = not use_vptree
     deduper.frame_index_workers = frame_index_workers
     deduper.frame_index_persist_progress = test_run is not None

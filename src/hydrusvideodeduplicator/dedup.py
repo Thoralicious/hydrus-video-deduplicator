@@ -486,6 +486,7 @@ class HydrusVideoDeduplicator:
         self.diagnostics = None
         self.submit_results = True
         self.test_run_pairs = {}
+        self.collect_test_run_pairs = False
         self.frame_index = True
         self.frame_index_workers = -2
         self.frame_index_persist_progress = False
@@ -839,6 +840,12 @@ class HydrusVideoDeduplicator:
             print("[blue]Running search tree maintenance...")
             tree.maintain_tree()
 
+    def _record_test_run_pair(self, file_a: str, file_b: str, score: float):
+        if self.collect_test_run_pairs:
+            pair = tuple(sorted((file_a, file_b)))
+            pair_scores = self.test_run_pairs.setdefault(pair, [None, None])
+            pair_scores[0 if file_a == pair[0] else 1] = float(score)
+
     def find_potential_duplicates(
         self,
     ) -> int:
@@ -857,11 +864,6 @@ class HydrusVideoDeduplicator:
                 except Exception as error:
                     raise FrameIndexError(f"Could not identify the Hydrus client ({type(error).__name__}).") from None
 
-            def record_pair(file_a: str, file_b: str, score: int):
-                pair = tuple(sorted((file_a, file_b)))
-                pair_scores = self.test_run_pairs.setdefault(pair, [None, None])
-                pair_scores[0 if file_a == pair[0] else 1] = float(score)
-
             self.db.commit()
             if self.diagnostics:
                 self.diagnostics.progress(efi_search_started=True)
@@ -877,7 +879,7 @@ class HydrusVideoDeduplicator:
                 ) if self.update_progress_callback else None,
                 workers=self.frame_index_workers,
                 output_directory=self.log_directory,
-                record_pair=record_pair,
+                record_pair=self._record_test_run_pair if self.collect_test_run_pairs else None,
                 submission_enabled=self.submit_results,
                 persist_progress=self.frame_index_persist_progress,
                 progress_batch_size=self.frame_index_progress_batch_size,
@@ -927,51 +929,8 @@ class HydrusVideoDeduplicator:
             self.hydlog.info(f'Similar files found: "{hash_a}" and "{hash_b}"')
             self.mark_videos_as_duplicates(hash_a, hash_b)
 
-        with tqdm(
-            dynamic_ncols=True, total=len(files), desc="Finding potential duplicates", unit="file", colour="BLUE"
-        ) as pbar:
-            processed_count = 0
-            for hash_id in files:
-                if self.update_progress_callback:
-                    self.update_progress_callback(SearchingForDuplicatesProgress(complete=pbar.n, total=pbar.total))
-                if self.should_skip_step_fn and self.should_skip_step_fn():
-                    # Stop searching, but still report the pairs found so far.
-                    break
-
-                hash_id = hash_id[0]
-                with self.diagnostics.operation("duplicate_search", hash_id=hash_id) if self.diagnostics else nullcontext():
-                    result = tree.search_file(hash_id, max_hamming_distance=search_threshold)
-                file_hash_a = self.db.get_file_hash(hash_id)
-                for similar_hash_id, distance in result:
-                    file_hash_b = self.db.get_file_hash(similar_hash_id)
-                    if hash_id != similar_hash_id:
-                        score = max(0.0, min(100.0, 101.0 - distance))
-                        pair = tuple(sorted((file_hash_a, file_hash_b)))
-                        pair_scores = self.test_run_pairs.setdefault(pair, [None, None])
-                        pair_scores[0 if file_hash_a == pair[0] else 1] = score
-                        mark_pair_once(file_hash_a, file_hash_b)
-
-                # TODO:
-                # Do we need to add the below line here? See _PerceptualHashesSearchForPotentialDuplicates in Hydrus.
-                # group_of_hash_ids = self._STL( self._Execute( 'SELECT hash_id FROM shape_search_cache WHERE searched_distance IS NULL or searched_distance < ?;', ( search_distance, ) ).fetchmany( 10 ) )   # noqa: E501
-                # Update the search cache
-                self.db.execute(
-                    "UPDATE shape_search_cache SET searched_distance = ? WHERE hash_id = ?;",
-                    (search_threshold, hash_id),
-                )
-
-                processed_count += 1
-                # Commit periodically to save progress in case something fails.
-                COMMIT_BATCH_SIZE = 64
-                if processed_count % COMMIT_BATCH_SIZE == 0:
-                    self.db.commit()
-
-                pbar.update(1)
-                if self.diagnostics:
-                    self.diagnostics.progress(videos_searched=pbar.n, total_videos=pbar.total)
-                if self.update_progress_callback:
-                    self.update_progress_callback(SearchingForDuplicatesProgress(complete=pbar.n, total=pbar.total))
-
+        # Complete old -> new coverage before any new file can be checkpointed.
+        # On cancellation or submission failure, the new files remain pending.
         if new_phashes:
             old_query_rows = self.db.execute(
                 "SELECT shape_search_cache.hash_id, shape_perceptual_hashes.phash, files.file_hash "
@@ -995,18 +954,55 @@ class HydrusVideoDeduplicator:
                         continue
                     for new_hash_id, new_phash, new_file_hash in new_phashes:
                         if self.should_skip_step_fn and self.should_skip_step_fn():
-                            break
+                            return len(found_pairs)
                         if old_hash_id == new_hash_id:
                             continue
                         distance = vptree.calculate_distance(old_phash, new_phash)
                         if distance <= search_threshold:
                             score = max(0.0, min(100.0, 101.0 - distance))
-                            pair = tuple(sorted((old_file_hash, new_file_hash)))
-                            pair_scores = self.test_run_pairs.setdefault(pair, [None, None])
-                            pair_scores[0 if old_file_hash == pair[0] else 1] = score
+                            self._record_test_run_pair(old_file_hash, new_file_hash, score)
                             mark_pair_once(old_file_hash, new_file_hash)
                     reverse_pbar.update(1)
-                    if self.should_skip_step_fn and self.should_skip_step_fn():
-                        break
+
+        with tqdm(
+            dynamic_ncols=True, total=len(files), desc="Finding potential duplicates", unit="file", colour="BLUE"
+        ) as pbar:
+            processed_count = 0
+            for hash_id in files:
+                if self.update_progress_callback:
+                    self.update_progress_callback(SearchingForDuplicatesProgress(complete=pbar.n, total=pbar.total))
+                if self.should_skip_step_fn and self.should_skip_step_fn():
+                    # Stop searching, but still report the pairs found so far.
+                    break
+
+                hash_id = hash_id[0]
+                with self.diagnostics.operation("duplicate_search", hash_id=hash_id) if self.diagnostics else nullcontext():
+                    result = tree.search_file(hash_id, max_hamming_distance=search_threshold)
+                file_hash_a = self.db.get_file_hash(hash_id)
+                for similar_hash_id, distance in result:
+                    file_hash_b = self.db.get_file_hash(similar_hash_id)
+                    if hash_id != similar_hash_id:
+                        score = max(0.0, min(100.0, 101.0 - distance))
+                        self._record_test_run_pair(file_hash_a, file_hash_b, score)
+                        mark_pair_once(file_hash_a, file_hash_b)
+
+                # A no-submission run must leave these queries eligible for a live run.
+                if self.submit_results:
+                    self.db.execute(
+                        "UPDATE shape_search_cache SET searched_distance = ? WHERE hash_id = ?;",
+                        (search_threshold, hash_id),
+                    )
+
+                processed_count += 1
+                # Commit periodically to save progress in case something fails.
+                COMMIT_BATCH_SIZE = 64
+                if processed_count % COMMIT_BATCH_SIZE == 0:
+                    self.db.commit()
+
+                pbar.update(1)
+                if self.diagnostics:
+                    self.diagnostics.progress(videos_searched=pbar.n, total_videos=pbar.total)
+                if self.update_progress_callback:
+                    self.update_progress_callback(SearchingForDuplicatesProgress(complete=pbar.n, total=pbar.total))
 
         return len(found_pairs)
