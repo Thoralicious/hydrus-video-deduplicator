@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, closing, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
@@ -57,6 +58,68 @@ class FailedPerceptuallyHashedFile:
 class HydrusApiException(Exception):
     """Wrapper around hydrus_api.HydrusAPIException to avoid some coupling with hydrus_api outside of FileHasher."""
 
+    def __init__(self, cause: Exception, *, transport_failure: bool = False):
+        super().__init__(str(cause))
+        self.cause = cause
+        self.transport_failure = transport_failure
+
+
+class HashingCircuitBreakers:
+    """Per-run guards for repeatedly failing local-path and HTTP video access."""
+
+    FAILURE_LIMIT = 3
+
+    def __init__(self):
+        self._lock = Lock()
+        self._local_path_failures = 0
+        self._local_path_disabled = False
+        self._http_failures = 0
+        self._http_open = False
+
+    @property
+    def local_path_enabled(self) -> bool:
+        with self._lock:
+            return not self._local_path_disabled
+
+    @property
+    def http_open(self) -> bool:
+        with self._lock:
+            return self._http_open
+
+    def local_path_succeeded(self) -> None:
+        with self._lock:
+            self._local_path_failures = 0
+
+    def local_path_failed(self) -> bool:
+        """Return True only when this failure disables local-path attempts."""
+        with self._lock:
+            if self._local_path_disabled:
+                return False
+            self._local_path_failures += 1
+            if self._local_path_failures >= self.FAILURE_LIMIT:
+                self._local_path_disabled = True
+                return True
+            return False
+
+    def http_succeeded(self) -> None:
+        with self._lock:
+            self._http_failures = 0
+
+    def http_failed(self) -> bool:
+        """Return True only when this failure opens the HTTP breaker."""
+        with self._lock:
+            if self._http_open:
+                return False
+            self._http_failures += 1
+            if self._http_failures >= self.FAILURE_LIMIT:
+                self._http_open = True
+                return True
+            return False
+
+
+def _is_hydrus_transport_failure(error: Exception) -> bool:
+    return isinstance(error, (hydrus_api.ConnectionError, RequestException, HTTPError))
+
 
 class FailedPerceptualHashException(Exception):
     """Exception for when files are failed to be perceptually hashed."""
@@ -71,13 +134,29 @@ class FileHasher:
     A class to fetch a file from Hydrus and phash it.
     """
 
-    def __init__(self, client: HVDClient, num_threads: int = 0, diagnostics=None, *, api=None):
+    def __init__(
+        self,
+        client: HVDClient,
+        num_threads: int = 0,
+        diagnostics=None,
+        *,
+        api=None,
+        circuit_breakers: HashingCircuitBreakers | None = None,
+    ):
         self.client = client
         self.api = client.client if api is None else api
         self.num_threads = num_threads
         self.diagnostics = diagnostics
+        self.circuit_breakers = circuit_breakers or HashingCircuitBreakers()
+
+    def _record_local_path_failure(self) -> None:
+        if self.circuit_breakers.local_path_failed():
+            tqdm.write("Local-path access disabled for this run after three consecutive failures; using HTTP fallback.")
 
     def _local_file_path(self, file_hash: str) -> Path | None:
+        if not self.circuit_breakers.local_path_enabled:
+            return None
+
         api_url = getattr(self.api, "api_url", None)
         try:
             hostname = urlsplit(api_url).hostname if isinstance(api_url, str) else None
@@ -90,7 +169,9 @@ class FileHasher:
             with self.diagnostics.operation("local_path_lookup", file_hash=file_hash) if self.diagnostics else nullcontext():
                 result = self.api.get_file_path(hash_=file_hash)
             path = Path(result["path"])
-        except (hydrus_api.HydrusAPIException, RequestException, AttributeError, KeyError, TypeError, ValueError):
+        except (hydrus_api.HydrusAPIException, RequestException, AttributeError, KeyError, TypeError, ValueError) as exc:
+            if _is_hydrus_transport_failure(exc):
+                self._record_local_path_failure()
             return None
         if not path.is_absolute():
             return None
@@ -111,25 +192,36 @@ class FileHasher:
             try:
                 with path.open("rb"):
                     pass
+                self.circuit_breakers.local_path_succeeded()
                 return path
             except OSError:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    self._record_local_path_failure()
                     return None
                 time.sleep(min(0.1, remaining))
 
     def _fetch_file(self, file_hash: str, *, timeout=None) -> bytes:
+        if self.circuit_breakers.http_open:
+            error = RuntimeError("HTTP hashing circuit is open after repeated Hydrus connection failures.")
+            raise HydrusApiException(error, transport_failure=True)
         try:
             with self.diagnostics.operation("video_download", file_hash=file_hash) if self.diagnostics else nullcontext():
                 response = (self.api.get_file(hash_=file_hash) if timeout is None
                             else self.api.get_file(hash_=file_hash, timeout=timeout))
                 with closing(response):
                     content = response.content
+            self.circuit_breakers.http_succeeded()
             if self.diagnostics:
                 self.diagnostics.progress(downloaded_bytes=len(content))
                 self.diagnostics.emit("video_download_complete", file_hash=file_hash, downloaded_bytes=len(content))
         except (hydrus_api.HydrusAPIException, RequestException, HTTPError) as exc:
-            raise HydrusApiException(exc) from exc
+            transport_failure = _is_hydrus_transport_failure(exc)
+            if transport_failure:
+                self.circuit_breakers.http_failed()
+            else:
+                self.circuit_breakers.http_succeeded()
+            raise HydrusApiException(exc, transport_failure=transport_failure) from exc
         return content
 
     def _phash_file(self, file: bytes | Path) -> bytes:
@@ -137,6 +229,10 @@ class FileHasher:
             with self.diagnostics.operation("decode_and_perceptual_hash") if self.diagnostics else nullcontext():
                 phash = compute_phash(file, self.num_threads)
             phash_bytes: bytes = phash.bytes
+        except OSError as exc:
+            if isinstance(file, Path):
+                raise
+            raise FailedPerceptualHashException(str(exc)) from exc
         except Exception as exc:
             raise FailedPerceptualHashException(str(exc))
 
@@ -160,13 +256,22 @@ class FileHasher:
                         if len(content) == size:
                             return content, True
             except OSError:
-                pass
+                self._record_local_path_failure()
+        if self.circuit_breakers.http_open:
+            error = RuntimeError("HTTP hashing circuit is open after repeated Hydrus connection failures.")
+            return FailedPerceptuallyHashedFile(file_hash, HydrusApiException(error, transport_failure=True))
         try:
             with closing(self.api.get_file(hash_=file_hash, timeout=(3, 30))) as response:
                 content = response.raw.read(size + 1, decode_content=True)
                 if len(content) == size:
+                    self.circuit_breakers.http_succeeded()
                     return content, False
-        except (hydrus_api.HydrusAPIException, RequestException, HTTPError, OSError, TypeError):
+        except (hydrus_api.HydrusAPIException, RequestException, HTTPError) as exc:
+            if _is_hydrus_transport_failure(exc):
+                self.circuit_breakers.http_failed()
+                return FailedPerceptuallyHashedFile(file_hash, HydrusApiException(exc, transport_failure=True))
+            self.circuit_breakers.http_succeeded()
+        except (OSError, TypeError):
             pass
         return None
 
@@ -193,7 +298,11 @@ class FileHasher:
         if local_path is not None:
             try:
                 phash = self._phash_file(local_path)
-            except (OSError, FailedPerceptualHashException):
+            except OSError:
+                self._record_local_path_failure()
+                if self.diagnostics:
+                    self.diagnostics.emit("video_local_path_fallback", file_hash=file_hash)
+            except FailedPerceptualHashException:
                 if self.diagnostics:
                     self.diagnostics.emit("video_local_path_fallback", file_hash=file_hash)
             else:
@@ -211,7 +320,8 @@ class FileHasher:
             # the next file to be hashed won't also immediately error.
             # This is a hack. There should probably be some counter in the result generator
             # for the number of failures before hashing is stopped entirely.
-            time.sleep(3)
+            if exc.transport_failure and not self.circuit_breakers.http_open:
+                time.sleep(3)
             return FailedPerceptuallyHashedFile(file_hash, exc)
 
         try:
@@ -260,7 +370,7 @@ class VideoInputQueue:
                 self.sizes = {}
         return self.sizes.get(self.files[index], {})
 
-    def take(self, index: int) -> tuple[bytes, bool] | None:
+    def take(self, index: int) -> tuple[bytes, bool] | FailedPerceptuallyHashedFile | None:
         self.reserved -= self.active_size
         self.active_size = 0
         next_index = self.pending[-1][0] + 1 if self.pending else index
@@ -281,6 +391,10 @@ class VideoInputQueue:
             self.active_size = 0
             self.discard()
             return None
+        if isinstance(prepared, FailedPerceptuallyHashedFile):
+            self.active_size = 0
+            self.discard()
+            return prepared
         if prepared is None:
             self.active_size = 0
             self.discard()
@@ -303,6 +417,8 @@ class PerceptualHashingStats:
     success_hash_count: int = 0
     failed_from_api_errors_count: int = 0
     failed_from_phash_count: int = 0
+    skipped_after_hydrus_outage_count: int = 0
+    stopped_due_to_hydrus_outage: bool = False
 
 
 class CancelledPerceptualHashException(Exception):
@@ -428,6 +544,7 @@ class HydrusVideoDeduplicator:
 
         if skip_hashing:
             print("[yellow]Skipping perceptual hashing")
+            hydrus_outage = False
         else:
             with self.diagnostics.operation("hydrus_file_selection") if self.diagnostics else nullcontext():
                 video_hashes = list(self.client.get_video_hashes(self.search_tags))
@@ -470,6 +587,21 @@ class HydrusVideoDeduplicator:
                                 "running the program with '--failed-page-name=failed'\n"
                             )
                     print(f"[green]Added {stats.success_hash_count} new perceptual hashes to the database.")
+                    if stats.skipped_after_hydrus_outage_count:
+                        print(
+                            f"[yellow]Skipped {stats.skipped_after_hydrus_outage_count} remaining files "
+                            "after repeated Hydrus connection failures."
+                        )
+                    hydrus_outage = stats.stopped_due_to_hydrus_outage
+
+            if hydrus_outage:
+                # EFI can still search the local database and save its pair report,
+                # but it must not try Hydrus submissions while the API is unavailable.
+                self.submit_results = False
+                print(
+                    f"[yellow]Hydrus remained unavailable. Continuing duplicate search without submitting "
+                    f"relationships; EFI results will be written under {self.log_directory}."
+                )
 
         if skip_search:
             print("[yellow]Skipping search index construction and duplicate search.")
@@ -503,7 +635,9 @@ class HydrusVideoDeduplicator:
         # This is just to print info for the user.
         # Note: This will be inaccurate if the user searches for duplicates in the Hydrus client
         #       while this is running.
-        pre_dedupe_count = self.client.get_potential_duplicate_count_hydrus()
+        pre_dedupe_count = None
+        if not hydrus_outage:
+            pre_dedupe_count = self.client.get_potential_duplicate_count_hydrus()
 
         print("\nTip: You can skip finding potential duplicates at any time by pressing CTRL+C.\n")
         self.db.begin_transaction()
@@ -514,12 +648,15 @@ class HydrusVideoDeduplicator:
                 print("[yellow]Searching for duplicates was interrupted! Progress was saved.")
 
         # Statistics for user
-        post_dedupe_count = self.client.get_potential_duplicate_count_hydrus()
-        new_dedupes_count = post_dedupe_count - pre_dedupe_count
-        if new_dedupes_count > 0:
-            print(f"[green]{new_dedupes_count} new potential duplicate pairs marked for manual processing!")
+        if hydrus_outage:
+            print(f"[green]{num_similar_pairs} potential duplicate pairs found; see the EFI JSON report.")
         else:
-            print("[green]No new potential duplicate pairs found.")
+            post_dedupe_count = self.client.get_potential_duplicate_count_hydrus()
+            new_dedupes_count = post_dedupe_count - pre_dedupe_count
+            if new_dedupes_count > 0:
+                print(f"[green]{new_dedupes_count} new potential duplicate pairs marked for manual processing!")
+            else:
+                print("[green]No new potential duplicate pairs found.")
 
         self.hydlog.info(f"{num_similar_pairs} similar file pairs found.")
         self.hydlog.info("Deduplication done.")
@@ -550,7 +687,11 @@ class HydrusVideoDeduplicator:
                 unit="file",
                 colour="BLUE",
             ) as pbar, ExitStack() as input_stack:
-                filehasher = FileHasher(self.client, self.job_count, self.diagnostics)
+                circuit_breakers = HashingCircuitBreakers()
+                filehasher = FileHasher(
+                    self.client, self.job_count, self.diagnostics,
+                    circuit_breakers=circuit_breakers,
+                )
                 input_queue = None
                 new_session_client = getattr(self.client.client, "new_session_client", None)
                 if video_hashes and (budget := input_buffer_budget()) and callable(new_session_client):
@@ -561,7 +702,11 @@ class HydrusVideoDeduplicator:
                     input_queue = VideoInputQueue(
                         worker,
                         filehasher,
-                        FileHasher(self.client, self.job_count, self.diagnostics, api=background_api),
+                        FileHasher(
+                            self.client, self.job_count, self.diagnostics,
+                            api=background_api,
+                            circuit_breakers=circuit_breakers,
+                        ),
                         video_hashes,
                         budget,
                     )
@@ -576,9 +721,12 @@ class HydrusVideoDeduplicator:
                         return stats
 
                     prepared = input_queue.take(index) if input_queue is not None else None
-                    local_buffer = prepared is not None and prepared[1]
-                    with self.diagnostics.operation("video_fetch_and_hash", file_hash=video_hash) if self.diagnostics else nullcontext():
-                        result = filehasher.hash_buffer(video_hash, prepared)
+                    local_buffer = isinstance(prepared, tuple) and prepared[1]
+                    if isinstance(prepared, FailedPerceptuallyHashedFile):
+                        result = prepared
+                    else:
+                        with self.diagnostics.operation("video_fetch_and_hash", file_hash=video_hash) if self.diagnostics else nullcontext():
+                            result = filehasher.hash_buffer(video_hash, prepared)
                     del prepared
                     if local_buffer and isinstance(result, FailedPerceptuallyHashedFile):
                         input_queue.discard()
@@ -611,6 +759,12 @@ class HydrusVideoDeduplicator:
                     pbar.update(1)
                     if self.update_progress_callback:
                         self.update_progress_callback(HashingProgress(complete=pbar.n, total=pbar.total))
+                    if circuit_breakers.http_open:
+                        stats.stopped_due_to_hydrus_outage = True
+                        stats.skipped_after_hydrus_outage_count = len(video_hashes) - pbar.n
+                        if input_queue is not None:
+                            input_queue.discard()
+                        break
         except KeyboardInterrupt:
             raise CancelledPerceptualHashException(stats)
         gc.collect()

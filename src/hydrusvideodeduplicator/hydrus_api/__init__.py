@@ -898,7 +898,12 @@ class Client:
 
     def new_session_client(self) -> "Client":
         """Create a separate API session for background file prefetch."""
-        return Client(access_key=self.access_key, api_url=self.api_url, verify_cert=self._verify_cert)
+        return Client(
+            access_key=self.access_key,
+            api_url=self.api_url,
+            verify_cert=self._verify_cert,
+            request_timeout=self._request_timeout,
+        )
 
     def get_file_path(self, hash_: str) -> dict[str, T.Any]:
         with self._api_request(
