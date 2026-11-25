@@ -22,8 +22,11 @@ from tqdm import tqdm
 
 
 class SearchDiagnostics:
-    def __init__(self, directory: Path, interval=2.0, *, watchdog=True,
-                 max_events=100000, max_detailed_comparisons=1000):
+    def __init__(self, directory: Path, interval=2.0, *, groups=None,
+                 trace_limit=None, max_detailed_comparisons=1000):
+        self.groups = set(groups or {"time", "cpu", "mem", "io"})
+        self.trace_enabled = trace_limit is not None
+        self.max_events = trace_limit if trace_limit is not None else 100000
         directory.mkdir(parents=True, exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         run_id = f"{stamp}-{uuid4().hex[:8]}"
@@ -35,7 +38,6 @@ class SearchDiagnostics:
         self.comparisons = self.file_comparisons = 0
         self.last_display = 0.0
         self.interval = max(.5, float(interval))
-        self.max_events = max_events
         self.max_detailed_comparisons = max_detailed_comparisons
         self.event_count = self.dropped_events = 0
         self.lock = threading.RLock()
@@ -55,8 +57,9 @@ class SearchDiagnostics:
         self.emit("session_start", python_version=platform.python_version(), platform=platform.platform(),
                   accelerator_version=accelerator_version,
                   logical_cpus=os.cpu_count(), interval_seconds=self.interval,
-                  max_events=max_events, max_detailed_comparisons=max_detailed_comparisons)
-        if watchdog:
+                  groups=sorted(self.groups), trace_enabled=self.trace_enabled,
+                  max_events=trace_limit, max_detailed_comparisons=max_detailed_comparisons)
+        if self.groups & {"cpu", "mem", "io"}:
             try:
                 self.status_file = self.status_path.open('x+b')
                 self.status_file.truncate(STATUS_SIZE)
@@ -67,7 +70,8 @@ class SearchDiagnostics:
                 else:
                     command = [sys.executable, '-m', 'hydrusvideodeduplicator.diagnostic_watchdog']
                 command.extend(['--pid', str(os.getpid()), '--status', str(self.status_path),
-                                '--output', str(self.resource_path), '--interval', str(self.interval)])
+                                '--output', str(self.resource_path), '--interval', str(self.interval),
+                                '--metrics', ','.join(sorted(self.groups & {"cpu", "mem", "io"}))])
                 process_options = {
                     'stdin': subprocess.DEVNULL,
                     'stdout': subprocess.DEVNULL,
@@ -134,6 +138,8 @@ class SearchDiagnostics:
         with self.lock:
             if self.closed and event != 'session_end': return
             essential = event in ('session_start','session_end','operation_interrupted','monitor_unavailable')
+            if not self.trace_enabled and not essential:
+                return
             if self.event_count >= self.max_events and not essential:
                 self.dropped_events += 1
                 return
@@ -163,7 +169,7 @@ class SearchDiagnostics:
             self.operations.append(item)
             self.last_progress_at = time.monotonic()
             self._publish(force=True)
-        if _detail: self.emit('operation_start',operation=name,**fields)
+        if _detail and self.trace_enabled: self.emit('operation_start',operation=name,**fields)
         outcome = 'completed'
         try:
             yield
@@ -173,7 +179,7 @@ class SearchDiagnostics:
                       error_type=type(error).__name__,**fields)
             raise
         else:
-            if _detail: self.emit('operation_complete',operation=name,duration_seconds=time.perf_counter()-started,**fields)
+            if _detail and self.trace_enabled: self.emit('operation_complete',operation=name,duration_seconds=time.perf_counter()-started,**fields)
         finally:
             with self.lock:
                 duration = time.perf_counter()-started
@@ -209,12 +215,12 @@ class SearchDiagnostics:
                 f"frame hashes; {self.file_comparisons} comparisons completed"
             )
             self.last_display = now
-        with self.operation("native_comparison", _detail=self.comparisons < self.max_detailed_comparisons, **fields):
+        with self.operation("native_comparison", _detail=self.trace_enabled and self.comparisons < self.max_detailed_comparisons, **fields):
             result = calculate(query, candidate)
         self.file_comparisons += 1
         self.comparisons += 1
         self.progress(comparisons_completed=self.file_comparisons)
-        if self.comparisons <= self.max_detailed_comparisons:
+        if self.trace_enabled and self.comparisons <= self.max_detailed_comparisons:
             self.emit("comparison_result", distance=result, comparisons_completed=self.comparisons, **fields)
         return result
 
@@ -238,9 +244,15 @@ class SearchDiagnostics:
         self.emit('session_end',comparisons_completed=self.comparisons,dropped_detail_events=self.dropped_events)
         for stream in self.streams.values():
             stream.close()
-        summary = {'elapsed_seconds':time.perf_counter()-self.started,'comparisons':self.comparisons,
-                   'dropped_detail_events':self.dropped_events,'stage_totals':self.totals,
-                   'comparison_counter_scope':'Legacy video scoring calls; frame-index work has separate query counters.',
+        summary = {'diagnostic_groups':sorted(self.groups),'trace_enabled':self.trace_enabled,
+                   'trace_event_cap':self.max_events if self.trace_enabled else None,
                    'phase_logs':{phase:str(path) for phase,path in self.paths.items()},
-                   'resource_file':str(self.resource_path),'watchdog_exit_code':self.worker.returncode if self.worker is not None else None,'timing_note':'Nested stage times overlap; do not sum inclusive durations.'}
+                   'resource_file':str(self.resource_path) if self.worker is not None else None,
+                   'watchdog_exit_code':self.worker.returncode if self.worker is not None else None}
+        if 'time' in self.groups:
+            summary.update(elapsed_seconds=time.perf_counter()-self.started,
+                           stage_totals=self.totals,comparisons=self.comparisons,
+                           dropped_detail_events=self.dropped_events,
+                           comparison_counter_scope='Legacy video scoring calls; frame-index work has separate query counters.',
+                           timing_note='Nested stage times overlap; do not sum inclusive durations.')
         self.path.with_suffix('.summary.json').write_text(json.dumps(summary,indent=2)+'\n',encoding='utf-8')

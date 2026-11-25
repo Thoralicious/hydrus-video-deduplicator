@@ -139,7 +139,11 @@ def main(
     dedup_database_dir: Annotated[
         Optional[Path], typer.Option(help="The directory to store the database used for dedupe.")
     ] = config.dedupe_database_dir,
-    diagnostic_mode: Annotated[bool, typer.Option("--diagnostic-mode", is_flag=True, help="Record program stages and resource usage.")] = False,
+    diagnostic_mode: Annotated[
+        Optional[str],
+        typer.Option("--diagnostic-mode", help="Diagnostic groups: time,cpu,mem,io (bare switch enables all four)."),
+    ] = None,
+    trace: Annotated[Optional[int], typer.Option("--trace", help="Record detailed diagnostic events, capped at this count (bare switch: 100000).")] = None,
     diagnostics_interval: Annotated[float, typer.Option(help="Seconds between resource samples.")] = 2.0,
     log_path: Annotated[Optional[Path], typer.Option(help="Directory for diagnostic and test-run JSON files.")] = None,
     submit_results: Annotated[
@@ -157,6 +161,23 @@ def main(
 ):
     # Fix mypy errors from optional parameters
     assert threshold is not None and job_count is not None
+
+    diagnostic_groups = None
+    if diagnostic_mode is not None:
+        requested_groups = {value.strip().lower() for value in diagnostic_mode.split(",")}
+        allowed_groups = {"time", "cpu", "mem", "io"}
+        if not requested_groups or "" in requested_groups or not requested_groups <= allowed_groups:
+            invalid = sorted(requested_groups - allowed_groups)
+            detail = f" Unknown group(s): {', '.join(invalid)}." if invalid else ""
+            raise typer.BadParameter(
+                f"Use a comma-separated selection of time,cpu,mem,io.{detail}",
+                param_hint="--diagnostic-mode",
+            )
+        diagnostic_groups = requested_groups
+    if trace is not None and diagnostic_groups is None:
+        raise typer.BadParameter("--trace requires --diagnostic-mode.", param_hint="--trace")
+    if trace is not None and trace < 1:
+        raise typer.BadParameter("Trace event cap must be a positive integer.", param_hint="--trace")
 
     if submit_results is None:
         submission_enabled = test_run is None
@@ -211,8 +232,21 @@ def main(
         test_run_report_path = prepare_test_database(dedup_database_dir, test_run)
     else:
         DedupeDB.set_db_name("videohashes.sqlite")
-    diagnostics = SearchDiagnostics(log_directory, interval=diagnostics_interval) if diagnostic_mode else None
+    diagnostics = (
+        SearchDiagnostics(
+            log_directory,
+            interval=diagnostics_interval,
+            groups=diagnostic_groups,
+            trace_limit=trace,
+        )
+        if diagnostic_groups is not None
+        else None
+    )
     if diagnostics is not None:
+        print(
+            "Diagnostics enabled: " + ",".join(sorted(diagnostic_groups))
+            + (f"; trace event cap {trace}" if trace is not None else "; detailed trace disabled")
+        )
         atexit.register(diagnostics.close)
 
     # Print a warning if the deprecated overwrite option is set
@@ -411,6 +445,20 @@ def run_main(gui: bool, is_executable: bool):
             gui_main(config)
         else:
             try:
+                # Typer models options as either flags or value options. Normalize the two
+                # optional-value switches here so their bare forms retain useful defaults.
+                normalized_args = sys.argv[:1]
+                index = 1
+                while index < len(sys.argv):
+                    arg = sys.argv[index]
+                    next_is_option = index + 1 == len(sys.argv) or sys.argv[index + 1].startswith("-")
+                    if arg == "--diagnostic-mode" and next_is_option:
+                        arg = "--diagnostic-mode=time,cpu,mem,io"
+                    elif arg == "--trace" and next_is_option:
+                        arg = "--trace=100000"
+                    normalized_args.append(arg)
+                    index += 1
+                sys.argv = normalized_args
                 typer.run(main)
             except KeyboardInterrupt as exc:
                 raise typer.Exit(-1) from exc

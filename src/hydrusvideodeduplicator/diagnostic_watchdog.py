@@ -17,8 +17,9 @@ STATUS_SIZE = 16384
 
 
 class ProcessSampler:
-    def __init__(self, pid):
+    def __init__(self, pid, metrics=None):
         self.pid = pid
+        self.metrics = set(metrics or {"cpu", "mem", "io"})
         self.handle = None
         if os.name == 'nt':
             from ctypes import wintypes as w
@@ -52,35 +53,43 @@ class ProcessSampler:
             exit_code = self.w.DWORD()
             if not self.kernel.GetExitCodeProcess(self.handle,ctypes.byref(exit_code)) or exit_code.value != 259:
                 return None
-            memory = self.Memory(); memory.cb = ctypes.sizeof(memory)
-            if not self.psapi.GetProcessMemoryInfo(self.handle,ctypes.byref(memory),memory.cb):
-                raise OSError(ctypes.get_last_error(),'Cannot sample memory')
-            times = [self.w.FILETIME() for _ in range(4)]
-            if not self.kernel.GetProcessTimes(self.handle,*(ctypes.byref(value) for value in times)):
-                raise OSError(ctypes.get_last_error(),'Cannot sample CPU')
-            ticks = lambda value: (value.dwHighDateTime<<32)|value.dwLowDateTime
-            result = {'cpu_seconds':(ticks(times[2])+ticks(times[3]))/10000000,
-                      'rss_bytes':memory.WorkingSetSize,'os_peak_rss_bytes':memory.PeakWorkingSetSize,
-                      'private_bytes':memory.PrivateUsage,'os_peak_commit_bytes':memory.PeakPagefileUsage}
-            io = self.IO()
-            if self.kernel.GetProcessIoCounters(self.handle,ctypes.byref(io)):
-                result.update(read_transfer_bytes=io.ReadTransferCount,write_transfer_bytes=io.WriteTransferCount)
+            result = {}
+            if "mem" in self.metrics:
+                memory = self.Memory(); memory.cb = ctypes.sizeof(memory)
+                if not self.psapi.GetProcessMemoryInfo(self.handle,ctypes.byref(memory),memory.cb):
+                    raise OSError(ctypes.get_last_error(),'Cannot sample memory')
+                result.update(rss_bytes=memory.WorkingSetSize,os_peak_rss_bytes=memory.PeakWorkingSetSize,
+                              private_bytes=memory.PrivateUsage,os_peak_commit_bytes=memory.PeakPagefileUsage)
+            if "cpu" in self.metrics:
+                times = [self.w.FILETIME() for _ in range(4)]
+                if not self.kernel.GetProcessTimes(self.handle,*(ctypes.byref(value) for value in times)):
+                    raise OSError(ctypes.get_last_error(),'Cannot sample CPU')
+                ticks = lambda value: (value.dwHighDateTime<<32)|value.dwLowDateTime
+                result['cpu_seconds'] = (ticks(times[2])+ticks(times[3]))/10000000
+            if "io" in self.metrics:
+                io = self.IO()
+                if self.kernel.GetProcessIoCounters(self.handle,ctypes.byref(io)):
+                    result.update(read_transfer_bytes=io.ReadTransferCount,write_transfer_bytes=io.WriteTransferCount)
             return result
         proc = Path('/proc')/str(self.pid)
         try:
             stat = (proc/'stat').read_text().rsplit(')',1)[1].split()
             if stat[0] == 'Z': return None
-            result = {'cpu_seconds':(int(stat[11])+int(stat[12]))/os.sysconf('SC_CLK_TCK')}
-            fields = {}
-            for line in (proc/'status').read_text().splitlines():
-                key,_,value = line.partition(':')
-                fields[key] = value.strip()
-            for source,target in (('VmRSS','rss_bytes'),('VmHWM','os_peak_rss_bytes')):
-                if source in fields: result[target] = int(fields[source].split()[0])*1024
-            try:
-                io = dict(line.split(':',1) for line in (proc/'io').read_text().splitlines())
-                result.update(read_transfer_bytes=int(io['rchar']),write_transfer_bytes=int(io['wchar']))
-            except (OSError,KeyError,ValueError): pass
+            result = {}
+            if "cpu" in self.metrics:
+                result['cpu_seconds'] = (int(stat[11])+int(stat[12]))/os.sysconf('SC_CLK_TCK')
+            if "mem" in self.metrics:
+                fields = {}
+                for line in (proc/'status').read_text().splitlines():
+                    key,_,value = line.partition(':')
+                    fields[key] = value.strip()
+                for source,target in (('VmRSS','rss_bytes'),('VmHWM','os_peak_rss_bytes')):
+                    if source in fields: result[target] = int(fields[source].split()[0])*1024
+            if "io" in self.metrics:
+                try:
+                    io = dict(line.split(':',1) for line in (proc/'io').read_text().splitlines())
+                    result.update(read_transfer_bytes=int(io['rchar']),write_transfer_bytes=int(io['wchar']))
+                except (OSError,KeyError,ValueError): pass
             return result
         except (FileNotFoundError,ProcessLookupError):
             return None
@@ -96,8 +105,9 @@ def read_status(shared, previous):
     except (ValueError,UnicodeError): return previous
 
 
-def monitor(pid, status_path, output_path, interval, terminal=True):
-    sampler = ProcessSampler(pid)
+def monitor(pid, status_path, output_path, interval, terminal=True, metrics=None):
+    metrics = set(metrics or {"cpu", "mem", "io"})
+    sampler = ProcessSampler(pid, metrics)
     previous = None
     status = {}
     peaks = {}
@@ -112,10 +122,11 @@ def monitor(pid, status_path, output_path, interval, terminal=True):
                 try:
                     resources = sampler.sample()
                     if resources is None: break
-                    resources['cpu_percent_one_core'] = None if previous is None else max(0,
-                        100*(resources['cpu_seconds']-previous[1])/(now-previous[0]))
-                    previous = (now,resources['cpu_seconds'])
-                    for name in ('rss_bytes','private_bytes','os_peak_rss_bytes','os_peak_commit_bytes'):
+                    if "cpu" in metrics:
+                        resources['cpu_percent_one_core'] = None if previous is None else max(0,
+                            100*(resources['cpu_seconds']-previous[1])/(now-previous[0]))
+                        previous = (now,resources['cpu_seconds'])
+                    for name in ('rss_bytes','private_bytes','os_peak_rss_bytes','os_peak_commit_bytes') if "mem" in metrics else ():
                         if name in resources: peaks[name] = max(peaks.get(name,0),resources[name])
                     samples += 1
                     age = max(0,now-status.get('last_progress_at',now))
@@ -127,15 +138,17 @@ def monitor(pid, status_path, output_path, interval, terminal=True):
                               'details':status.get('details',{}),'current_phase_has_counter':status.get('current_phase_has_counter',False),**resources}
                     output.write(json.dumps(record)+'\n'); output.flush()
                     if terminal and not status.get('closed'):
-                        cpu = resources['cpu_percent_one_core']
+                        cpu = resources.get('cpu_percent_one_core')
                         cpu_text = '?' if cpu is None else f'{cpu:.0f}%'
-                        rss = resources.get('rss_bytes',0)/1024**2
+                        resource_text = []
+                        if "cpu" in metrics: resource_text.append(f"CPU {cpu_text} (100%=one core)")
+                        if "mem" in metrics: resource_text.append(f"RSS {resources.get('rss_bytes', 0)/1024**2:.0f} MiB")
                         progress = record['progress']
                         detail = ', '.join(f'{key}={value}' for key,value in list(progress.items())[:5])
                         if not detail: detail = 'no internal progress counter for this phase'
                         elif not record['current_phase_has_counter']: detail += '; current phase has no internal counter'
                         print(f"[monitor] {record['stage']}: {record['stage_elapsed_seconds']:.1f}s; {detail}; "
-                              f"last observed progress {age:.1f}s ago; CPU {cpu_text} (100%=one core); RSS {rss:.0f} MiB",flush=True)
+                              f"last observed progress {age:.1f}s ago; {', '.join(resource_text)}",flush=True)
                 except (OSError,ValueError,KeyError) as error:
                     errors += 1
                     output.write(json.dumps({'event':'monitor_error','error_type':type(error).__name__})+'\n'); output.flush()
@@ -162,8 +175,12 @@ def main(argv=None):
     parser.add_argument('--status',required=True)
     parser.add_argument('--output',required=True)
     parser.add_argument('--interval',type=float,default=2)
+    parser.add_argument('--metrics',default='cpu,mem,io')
     args = parser.parse_args(argv)
-    monitor(args.pid,args.status,args.output,max(.5,args.interval))
+    metrics = {value.strip() for value in args.metrics.split(',') if value.strip()}
+    if not metrics or not metrics <= {'cpu','mem','io'}:
+        parser.error('--metrics must contain one or more of cpu,mem,io')
+    monitor(args.pid,args.status,args.output,max(.5,args.interval),metrics=metrics)
 
 
 def run_if_requested():
