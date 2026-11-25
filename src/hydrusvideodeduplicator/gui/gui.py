@@ -597,12 +597,19 @@ If you change this value you should clear the search cache. This isn't cleared a
             if self.worker_thread is not None and self.worker_thread.isRunning():
                 self.worker_thread.quit()
                 if not self.worker_thread.wait(10000):
-                    # Force stop.
                     print_and_log(
-                        self.logger, "Worker thread did not stop in time. Forcing it to stop.", logging.WARNING
+                        self.logger,
+                        "Worker thread is still stopping. The window will remain open until it exits.",
+                        logging.WARNING,
                     )
-                    self.worker_thread.terminate()
-                    self.worker_thread.wait()
+                    self._shutting_down = False
+                    event.ignore()
+                    QMessageBox.warning(
+                        self,
+                        "Still stopping",
+                        "The background operation has not stopped yet. Wait for it to finish, then close the window again.",
+                    )
+                    return
         except RuntimeError:
             # Thread may have already been deleted.
             pass
