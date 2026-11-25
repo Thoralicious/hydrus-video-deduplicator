@@ -739,8 +739,36 @@ class HydrusVideoDeduplicator:
             "SELECT hash_id FROM shape_search_cache WHERE searched_distance is NULL or searched_distance < :threshold",
             {"threshold": search_threshold},
         ).fetchall()
+        pending_hash_ids = {row[0] for row in files}
+        new_hash_ids = {
+            row[0]
+            for row in self.db.execute(
+                "SELECT hash_id FROM shape_search_cache WHERE searched_distance IS NULL"
+            ).fetchall()
+        }
 
-        num_similar_pairs = 0
+        # Previously completed queries do not normally run again when a video is
+        # added. Compare those old query hashes directly against only new hashes
+        # so old -> new matches are not missed.
+        new_phashes = []
+        for new_hash_id in new_hash_ids:
+            phash_id = self.db.get_phash_id_from_hash_id(new_hash_id)
+            if phash_id is not None:
+                phash = self.db.get_phash(phash_id)
+                file_hash = self.db.get_file_hash(new_hash_id)
+                if phash is not None and file_hash is not None:
+                    new_phashes.append((new_hash_id, phash, file_hash))
+
+        found_pairs = set()
+
+        def mark_pair_once(hash_a: str, hash_b: str) -> None:
+            pair = tuple(sorted((hash_a, hash_b)))
+            if pair in found_pairs:
+                return
+            found_pairs.add(pair)
+            self.hydlog.info(f'Similar files found: "{hash_a}" and "{hash_b}"')
+            self.mark_videos_as_duplicates(hash_a, hash_b)
+
         with tqdm(
             dynamic_ncols=True, total=len(files), desc="Finding potential duplicates", unit="file", colour="BLUE"
         ) as pbar:
@@ -763,9 +791,7 @@ class HydrusVideoDeduplicator:
                         pair = tuple(sorted((file_hash_a, file_hash_b)))
                         pair_scores = self.test_run_pairs.setdefault(pair, [None, None])
                         pair_scores[0 if file_hash_a == pair[0] else 1] = score
-                        self.hydlog.info(f'Similar files found: "{file_hash_a}" and "{file_hash_b}"')
-                        self.mark_videos_as_duplicates(file_hash_a, file_hash_b)
-                        num_similar_pairs += 1
+                        mark_pair_once(file_hash_a, file_hash_b)
 
                 # TODO:
                 # Do we need to add the below line here? See _PerceptualHashesSearchForPotentialDuplicates in Hydrus.
@@ -787,4 +813,42 @@ class HydrusVideoDeduplicator:
                     self.diagnostics.progress(videos_searched=pbar.n, total_videos=pbar.total)
                 if self.update_progress_callback:
                     self.update_progress_callback(SearchingForDuplicatesProgress(complete=pbar.n, total=pbar.total))
-        return num_similar_pairs // 2
+
+        if new_phashes:
+            old_query_rows = self.db.execute(
+                "SELECT shape_search_cache.hash_id, shape_perceptual_hashes.phash, files.file_hash "
+                "FROM shape_search_cache "
+                "JOIN shape_perceptual_hash_map USING (hash_id) "
+                "JOIN shape_perceptual_hashes USING (phash_id) "
+                "JOIN files USING (hash_id) "
+                "WHERE searched_distance >= :threshold",
+                {"threshold": search_threshold},
+            ).fetchall()
+            with tqdm(
+                dynamic_ncols=True,
+                total=len(old_query_rows),
+                desc="Checking existing files against new hashes",
+                unit="file",
+                colour="BLUE",
+            ) as reverse_pbar:
+                for old_hash_id, old_phash, old_file_hash in old_query_rows:
+                    if old_hash_id in pending_hash_ids:
+                        reverse_pbar.update(1)
+                        continue
+                    for new_hash_id, new_phash, new_file_hash in new_phashes:
+                        if self.should_skip_step_fn and self.should_skip_step_fn():
+                            break
+                        if old_hash_id == new_hash_id:
+                            continue
+                        distance = vptree.calculate_distance(old_phash, new_phash)
+                        if distance <= search_threshold:
+                            score = max(0.0, min(100.0, 101.0 - distance))
+                            pair = tuple(sorted((old_file_hash, new_file_hash)))
+                            pair_scores = self.test_run_pairs.setdefault(pair, [None, None])
+                            pair_scores[0 if old_file_hash == pair[0] else 1] = score
+                            mark_pair_once(old_file_hash, new_file_hash)
+                    reverse_pbar.update(1)
+                    if self.should_skip_step_fn and self.should_skip_step_fn():
+                        break
+
+        return len(found_pairs)
