@@ -29,7 +29,7 @@ class TestSmokeTest(unittest.TestCase):
             data = f.read()
             im = Image.open(BytesIO(data))
             im.thumbnail((512, 512))
-            im.convert("RGB")
+            im = im.convert("RGB")
             result = vpdq.hash_frame(im.tobytes(), im.width, im.height)
             (pdq_hash, quality) = result
             pdq_hash = str(pdq_hash, encoding="utf-8")
