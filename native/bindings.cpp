@@ -12,8 +12,10 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <string_view>
+#include <stdexcept>
 #include <thread>
 #include <tuple>
 #include <utility>
@@ -26,13 +28,38 @@ int hamming_distance(std::string const& a, std::string const& b)
     return facebook::pdq::hashing::hammingDistanceStrings(a, b);
 }
 
-std::tuple<py::bytes, int> hash_frame(py::bytes& img, std::size_t width, std::size_t height)
+static std::size_t checked_frame_bytes(std::size_t width, std::size_t height)
 {
-    auto hasher = facebook::vpdq::hashing::FrameBufferHasherFactory::createFrameHasher(width, height);
+    constexpr std::size_t min_dimension = 5;
+    const auto max_dimension = static_cast<std::size_t>(std::numeric_limits<int>::max());
+    if (width < min_dimension || height < min_dimension) {
+        throw py::value_error("frame width and height must be at least 5 pixels");
+    }
+    if (width > max_dimension || height > max_dimension || width > max_dimension / height) {
+        throw py::value_error("frame dimensions exceed the native hasher limits");
+    }
+    const auto pixels = width * height;
+    if (pixels > std::numeric_limits<std::size_t>::max() / 3U) {
+        throw py::value_error("frame dimensions exceed the addressable RGB buffer size");
+    }
+    return pixels * 3U;
+}
+
+std::tuple<py::bytes, int> hash_frame(const py::bytes& img, std::size_t width, std::size_t height)
+{
+    const auto expected_bytes = checked_frame_bytes(width, height);
+    if (static_cast<std::size_t>(py::len(img)) != expected_bytes) {
+        throw py::value_error("RGB frame buffer length does not match width * height * 3");
+    }
+
+    auto hasher = facebook::vpdq::hashing::FrameBufferHasherFactory::createFrameHasher(
+        static_cast<int>(height), static_cast<int>(width));
     facebook::pdq::hashing::Hash256 result{};
     std::string img_str{ img };
     int quality{};
-    hasher->hashFrame(reinterpret_cast<unsigned char*>(img_str.data()), result, quality);
+    if (!hasher->hashFrame(reinterpret_cast<unsigned char*>(img_str.data()), result, quality)) {
+        throw std::runtime_error("Failed to hash frame buffer");
+    }
     return std::make_tuple(result.format(), quality);
 }
 
@@ -115,19 +142,22 @@ public:
     }
 
     VideoHasher(float framerate, std::uint32_t width, std::uint32_t height, int thread_count)
-        : m_hasher{ fix_negative_thread_count(thread_count), VideoMetadata{ framerate, width, height } }
+        : m_frame_bytes{ checked_frame_bytes(width, height) }
+        , m_hasher{ fix_negative_thread_count(thread_count), VideoMetadata{ framerate, width, height } }
     {
     }
 
-    void hash_frame(py::bytes& img)
+    void hash_frame(const py::bytes& img)
     {
-        auto make_frame = [this, &img]() {
-            StringVideoFrame frame{ img, m_frame_num };
-            ++m_frame_num;
-            return frame;
-        };
-
-        m_hasher.push_back(make_frame());
+        if (static_cast<std::size_t>(py::len(img)) != m_frame_bytes) {
+            throw py::value_error("RGB frame buffer length does not match video width * height * 3");
+        }
+        if (m_frame_num > static_cast<std::uint64_t>(std::numeric_limits<int>::max())) {
+            throw std::overflow_error("video has more frames than the native hash format can represent");
+        }
+        StringVideoFrame frame{ img, m_frame_num };
+        m_hasher.push_back(std::move(frame));
+        ++m_frame_num;
     }
 
     facebook::vpdq::hashing::VpdqHash finish()
@@ -138,6 +168,7 @@ public:
     VideoHasher() = delete;
 
 private:
+    std::size_t m_frame_bytes;
     VpdqHasher<StringVideoFrame> m_hasher;
     std::uint64_t m_frame_num{ 0U };
 };
@@ -157,9 +188,8 @@ namespace hvd_native
  */
 static std::uint32_t findMatches(const std::string_view features1, const std::string_view features2, const int distanceTolerance)
 {
-    // Check for out of bounds.
     if (((features1.size() % VpdqHash::bytesPerPdqHash) != 0U) || ((features2.size() % VpdqHash::bytesPerPdqHash) != 0U)) {
-        return 0;
+        throw std::invalid_argument("packed hashes must be multiples of 32 bytes");
     }
 
     std::uint32_t matchCnt = 0;
@@ -178,6 +208,10 @@ static std::uint32_t findMatches(const std::string_view features1, const std::st
 
 int matchHash(const std::string_view qHashes, const std::string_view tHashes, const int distanceTolerance)
 {
+    if ((qHashes.size() % VpdqHash::bytesPerPdqHash) != 0U || (tHashes.size() % VpdqHash::bytesPerPdqHash) != 0U) {
+        throw std::invalid_argument("packed hashes must be multiples of 32 bytes");
+    }
+
     // Avoid divide-by-zero. Also if a video had all hashes filtered out because there were too low quality
     // then the hashes may be empty.
     if (qHashes.empty() || tHashes.empty()) {
@@ -239,7 +273,7 @@ PYBIND11_MODULE(_native, m)
         .def("from_bytes", &facebook::vpdq::hashing::VpdqHash::from_bytes)
         .def_property(
             "bytes", [](const facebook::vpdq::hashing::VpdqHash& s) -> py::bytes { return py::bytes(s.pdqHashes); },
-            [](facebook::vpdq::hashing::VpdqHash& s, py::bytes b) { s.pdqHashes = b.cast<std::string>(); })
+            [](facebook::vpdq::hashing::VpdqHash& s, py::bytes b) { s.set_bytes(b.cast<std::string>()); })
         .def("from_string", &facebook::vpdq::hashing::VpdqHash::from_string)
         .def("empty", &facebook::vpdq::hashing::VpdqHash::empty)
         .def_readonly_static("bytesPerPdqHash", &facebook::vpdq::hashing::VpdqHash::bytesPerPdqHash);

@@ -10,6 +10,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
+#include <stdexcept>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -66,15 +68,26 @@ struct VpdqHash {
 
   /// @brief Create a VpdqHash from the raw pdq hashes.
   static VpdqHash from_bytes(std::string pdqHashesBytes) {
+    validate_bytes(pdqHashesBytes);
     VpdqHash res{};
     res.pdqHashes = std::move(pdqHashesBytes);
     return res;
+  }
+
+  /// @brief Replace the raw pdq hashes after validating the packed representation.
+  void set_bytes(std::string pdqHashesBytes) {
+    validate_bytes(pdqHashesBytes);
+    pdqHashes = std::move(pdqHashesBytes);
   }
 
   /// @brief Create a VpdqHash from a hex string of pdq hashes.
   static VpdqHash from_string(const std::string& pdqHashesHex) {
     if ((pdqHashesHex.size() % (bytesPerPdqHash * 2U)) != 0) {
       throw std::invalid_argument("Hash string is incorrect length.");
+    }
+    if ((pdqHashesHex.size() / (bytesPerPdqHash * 2U)) >
+        std::numeric_limits<std::uint32_t>::max()) {
+      throw std::length_error("Hash contains too many frames.");
     }
     VpdqHash res{};
 
@@ -88,11 +101,20 @@ struct VpdqHash {
     // normal raw bytes hash.
     res.pdqHashes.reserve(pdqHashesHex.size() / 2U);
 
-    for (std::size_t i = 0; i < pdqHashesHex.size(); i += 2) {
-      unsigned int byte;
-      if (std::sscanf(pdqHashesHex.c_str() + i, "%2x", &byte) != 1) {
-        throw std::invalid_argument("Invalid hex string.");
+    const auto nibble = [](char c) -> unsigned char {
+      if (c >= '0' && c <= '9') {
+        return static_cast<unsigned char>(c - '0');
       }
+      if (c >= 'a' && c <= 'f') {
+        return static_cast<unsigned char>(c - 'a' + 10);
+      }
+      if (c >= 'A' && c <= 'F') {
+        return static_cast<unsigned char>(c - 'A' + 10);
+      }
+      throw std::invalid_argument("Invalid hex string.");
+    };
+    for (std::size_t i = 0; i < pdqHashesHex.size(); i += 2) {
+      const auto byte = static_cast<unsigned char>((nibble(pdqHashesHex[i]) << 4) | nibble(pdqHashesHex[i + 1]));
       res.pdqHashes.push_back(static_cast<char>(byte));
     }
 
@@ -106,10 +128,10 @@ struct VpdqHash {
   std::string to_string() const {
     std::string hex{};
     hex.reserve(pdqHashes.size() * 2);
-    char buf[3];
+    static constexpr char digits[] = "0123456789abcdef";
     for (unsigned char c : pdqHashes) {
-      std::sprintf(buf, "%02x", c);
-      hex.append(buf);
+      hex.push_back(digits[c >> 4]);
+      hex.push_back(digits[c & 0x0f]);
     }
     return hex;
   }
@@ -133,6 +155,17 @@ struct VpdqHash {
   }
 
   bool operator!=(const VpdqHash& other) const { return !(*this == other); }
+
+ private:
+  static void validate_bytes(const std::string& bytes) {
+    if ((bytes.size() % bytesPerPdqHash) != 0U) {
+      throw std::invalid_argument("packed hashes must be multiples of 32 bytes");
+    }
+    if ((bytes.size() / bytesPerPdqHash) >
+        std::numeric_limits<std::uint32_t>::max()) {
+      throw std::length_error("Hash contains too many frames.");
+    }
+  }
 };
 
 } // namespace hashing

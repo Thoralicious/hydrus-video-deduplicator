@@ -11,6 +11,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <exception>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -110,6 +111,9 @@ class VpdqHasher {
   /** @brief State of video hashing.
    **/
   bool m_done_hashing;
+
+  /** @brief First failure raised by a consumer thread, protected by the queue mutex. */
+  std::exception_ptr m_worker_error;
 
   /** @brief Video metadata.
    **/
@@ -214,8 +218,23 @@ VpdqHasher<TFrame>::VpdqHasher(
   // Create consumer hasher threads (multithreaded only)
   if (m_multithreaded) {
     consumer_threads.reserve(thread_count);
-    for (unsigned int thread_idx{0}; thread_idx < thread_count; ++thread_idx) {
-      consumer_threads.emplace_back(std::thread(&VpdqHasher::consumer, this));
+    try {
+      for (unsigned int thread_idx{0}; thread_idx < thread_count; ++thread_idx) {
+        consumer_threads.emplace_back(&VpdqHasher::consumer, this);
+      }
+    } catch (...) {
+      {
+        std::lock_guard<std::mutex> lock(m_queue_mutex);
+        m_done_hashing = true;
+      }
+      m_queue_condition.notify_all();
+      m_queue_not_full_condition.notify_all();
+      for (auto& thread : consumer_threads) {
+        if (thread.joinable()) {
+          thread.join();
+        }
+      }
+      throw;
     }
   }
 }
@@ -228,6 +247,9 @@ void VpdqHasher<TFrame>::push_back(TFrame&& frame) {
       m_queue_not_full_condition.wait(
           lock, [this] { return is_queue_full() || m_done_hashing; });
       if (m_done_hashing) {
+        if (m_worker_error) {
+          std::rethrow_exception(m_worker_error);
+        }
         return;
       }
       m_queue.push(std::move(frame));
@@ -243,16 +265,15 @@ void VpdqHasher<TFrame>::stop_hashing() {
   if (m_multithreaded) {
     {
       std::lock_guard<std::mutex> lock(m_queue_mutex);
-      if (m_done_hashing) {
-        return;
-      }
-
       m_done_hashing = true;
     }
 
     m_queue_condition.notify_all();
+    m_queue_not_full_condition.notify_all();
     for (auto& thread : consumer_threads) {
-      thread.join();
+      if (thread.joinable()) {
+        thread.join();
+      }
     }
   } else {
     // This variable isn't currently used for single-threaded hashing, but
@@ -264,16 +285,26 @@ void VpdqHasher<TFrame>::stop_hashing() {
 template <typename TFrame>
 VpdqHash VpdqHasher<TFrame>::finish() {
   this->stop_hashing();
-
-  // Filter features with the same exact hash.
-  for (std::size_t i = 0; i < m_result.size(); ++i) {
-    for (std::size_t j = i + 1; j < m_result.size(); ++j) {
-      if (m_result[i].pdqHash == m_result[j].pdqHash) {
-        m_result.erase(m_result.begin() + j);
-        --j;
-      }
-    }
+  if (m_worker_error) {
+    std::rethrow_exception(m_worker_error);
   }
+
+  // Keep the earliest frame for each hash, independent of worker completion order.
+  std::sort(
+      std::begin(m_result), std::end(m_result),
+      [](const vpdqFeature& a, const vpdqFeature& b) {
+        if (a.pdqHash == b.pdqHash) {
+          return a.frameNumber < b.frameNumber;
+        }
+        return a.pdqHash < b.pdqHash;
+      });
+  m_result.erase(
+      std::unique(
+          std::begin(m_result), std::end(m_result),
+          [](const vpdqFeature& a, const vpdqFeature& b) {
+            return a.pdqHash == b.pdqHash;
+          }),
+      std::end(m_result));
 
   // Sort out of order frames by frame number
   std::sort(
@@ -315,6 +346,9 @@ void VpdqHasher<TFrame>::consumer() {
     std::unique_lock<std::mutex> lock(m_queue_mutex);
     m_queue_condition.wait(
         lock, [this] { return !m_queue.empty() || m_done_hashing; });
+    if (m_worker_error) {
+      break;
+    }
     if (m_queue.empty() && m_done_hashing) {
       break;
     }
@@ -322,7 +356,20 @@ void VpdqHasher<TFrame>::consumer() {
     m_queue.pop();
     m_queue_not_full_condition.notify_one();
     lock.unlock();
-    hasher(frame);
+    try {
+      hasher(frame);
+    } catch (...) {
+      {
+        std::lock_guard<std::mutex> error_lock(m_queue_mutex);
+        if (!m_worker_error) {
+          m_worker_error = std::current_exception();
+        }
+        m_done_hashing = true;
+      }
+      m_queue_condition.notify_all();
+      m_queue_not_full_condition.notify_all();
+      return;
+    }
   }
 }
 
