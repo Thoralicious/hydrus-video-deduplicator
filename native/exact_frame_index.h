@@ -114,7 +114,16 @@ public:
         cancelled_.store(false);total_.store(count);done_.store(0);checks_.store(0);visits_.store(0);active_.store(true);
         struct Guard { std::atomic<bool>& flag;~Guard(){flag.store(false);} } guard{active_};
         // One shared immutable index; each worker owns its deduplication stamps and counts.
-        const auto actual=static_cast<std::size_t>(std::min<std::uint64_t>(workers,(count+15)/16));
+        auto actual=static_cast<std::size_t>(std::min<std::uint64_t>(workers,(count+15)/16));
+        if (count>0) {
+            // Each task claims 16 query frames. Keep at least four tasks' worth
+            // of work per worker so thread startup and per-worker scratch costs
+            // do not overwhelm short searches. A nonempty query still uses one
+            // worker, even when it has fewer than four tasks.
+            constexpr std::uint64_t min_frames_per_worker=64;
+            const auto work_limited_workers=std::max<std::uint64_t>(1,count/min_frames_per_worker);
+            actual=static_cast<std::size_t>(std::min<std::uint64_t>(actual,work_limited_workers));
+        }
         workers_active_.store(actual);
         struct WorkerGuard { std::atomic<std::uint64_t>& n; ~WorkerGuard(){n.store(0);} } worker_guard{workers_active_};
         if (worker_scratch_.size()<actual) worker_scratch_.resize(actual);
